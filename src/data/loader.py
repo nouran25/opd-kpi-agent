@@ -45,7 +45,9 @@ class OPDDataLoader:
             )
 
         if {"Total Revenue", "No. Cases"}.issubset(self.df.columns):
-            self.df["Revenue_per_Case"] = self.df["Total Revenue"] / self.df["No. Cases"]
+            self.df["Revenue_per_Case"] = (
+                self.df["Total Revenue"] / self.df["No. Cases"]
+            )
 
         if {"Total Leakage Revenue Losses", "Total Revenue"}.issubset(self.df.columns):
             self.df["Leakage_Impact_%"] = (

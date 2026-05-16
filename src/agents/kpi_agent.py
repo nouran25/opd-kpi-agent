@@ -213,8 +213,13 @@ class OPDKpiAgent:
         if metric and any(term in text for term in ["trend", "over time", "changed"]):
             return self._format_kpi_trend(metric, bu=bu, year=year)
 
-        if metric and any(term in text for term in ["compare", "across"]) and any(
-            term in text for term in ["bu", "bus", "business unit", "business units"]
+        if (
+            metric
+            and any(term in text for term in ["compare", "across"])
+            and any(
+                term in text
+                for term in ["bu", "bus", "business unit", "business units"]
+            )
         ):
             return self._format_bu_comparison(metric, year=year)
 
@@ -518,7 +523,9 @@ Recommended actions:
             ranking = df.groupby("Doctor Name")[metric].sum().reset_index()
         else:
             ranking = df.groupby("Doctor Name")[metric].mean().reset_index()
-        ranking = ranking.sort_values(metric, ascending=False).head(5).reset_index(drop=True)
+        ranking = (
+            ranking.sort_values(metric, ascending=False).head(5).reset_index(drop=True)
+        )
         ranking["rank"] = ranking.index + 1
 
         if ranking.empty:
@@ -598,10 +605,14 @@ Recommended actions:
             grouped = df.groupby("Doctor Name")[metric].mean().reset_index()
 
         if operator == "above":
-            result = grouped[grouped[metric] > threshold].sort_values(metric, ascending=False)
+            result = grouped[grouped[metric] > threshold].sort_values(
+                metric, ascending=False
+            )
             phrase = "above"
         else:
-            result = grouped[grouped[metric] < threshold].sort_values(metric, ascending=True)
+            result = grouped[grouped[metric] < threshold].sort_values(
+                metric, ascending=True
+            )
             phrase = "below"
 
         scope = self._scope_text(bu=bu, year=year)
@@ -708,9 +719,7 @@ Doctor: {doctor_name}
 
         total_revenue = float(df_doctor["Total Revenue"].sum())
         target_revenue = float(df_doctor["Target Revenue"].sum())
-        revenue_achievement = (
-            total_revenue / target_revenue if target_revenue else 0
-        )
+        revenue_achievement = total_revenue / target_revenue if target_revenue else 0
         total_cases = float(df_doctor["No. Cases"].sum())
         target_cases = float(df_doctor["Target No. cases"].sum())
         cases_achievement = total_cases / target_cases if target_cases else 0
@@ -782,7 +791,9 @@ Doctor: {doctor_name}
         metric_lower = metric.lower()
         numeric_value = float(value)
         if "%" in metric or "cr%" in metric_lower:
-            display_value = numeric_value * 100 if abs(numeric_value) <= 1.5 else numeric_value
+            display_value = (
+                numeric_value * 100 if abs(numeric_value) <= 1.5 else numeric_value
+            )
             return f"{display_value:.1f}%"
         if any(word in metric_lower for word in ["revenue", "losses"]):
             return f"${numeric_value:,.0f}"
@@ -889,7 +900,9 @@ Doctor: {doctor_name}
         driver_names = []
         for _, row in relationships.head(3).iterrows():
             driver = row.get("Child_KPI")
-            relationship = row.get("Relationship_Type") or row.get("Relationship") or "driver"
+            relationship = (
+                row.get("Relationship_Type") or row.get("Relationship") or "driver"
+            )
             weight = row.get("Driver_Weight") or row.get("Weight") or ""
             if driver:
                 label = f"{driver} ({relationship}"
@@ -909,7 +922,9 @@ Doctor: {doctor_name}
             doctor_revenue = self.analytics._aggregate_metric(
                 df_doctor, "Revenue_Achievement_%"
             )
-            peer_revenue = self._peer_doctor_metric_average(peer_df, "Revenue_Achievement_%")
+            peer_revenue = self._peer_doctor_metric_average(
+                peer_df, "Revenue_Achievement_%"
+            )
             if doctor_revenue < peer_revenue:
                 recommendations.append(
                     "Prioritize revenue achievement: review case volume, charge per case, booking conversion, and missed opportunities."
@@ -927,15 +942,21 @@ Doctor: {doctor_name}
             doctor_retention = self.analytics._aggregate_metric(
                 df_doctor, "Patient Retention %"
             )
-            peer_retention = self._peer_doctor_metric_average(peer_df, "Patient Retention %")
+            peer_retention = self._peer_doctor_metric_average(
+                peer_df, "Patient Retention %"
+            )
             if doctor_retention < peer_retention:
                 recommendations.append(
                     "Improve retention by reviewing follow-up discipline, care continuity, and post-visit communication."
                 )
 
         if "Service Leakage %" in df_doctor and "Service Leakage %" in peer_df:
-            doctor_leakage = self.analytics._aggregate_metric(df_doctor, "Service Leakage %")
-            peer_leakage = self._peer_doctor_metric_average(peer_df, "Service Leakage %")
+            doctor_leakage = self.analytics._aggregate_metric(
+                df_doctor, "Service Leakage %"
+            )
+            peer_leakage = self._peer_doctor_metric_average(
+                peer_df, "Service Leakage %"
+            )
             if doctor_leakage > peer_leakage:
                 recommendations.append(
                     "Investigate service leakage by specialty, missed opportunity, workflow compliance, and follow-up visit behavior."
@@ -1006,7 +1027,10 @@ Doctor: {doctor_name}
     def _extract_threshold_filter(self, text: str) -> dict | None:
         """Extract threshold filters such as above 20% or below 10."""
         patterns = [
-            (r"\b(above|over|greater than|more than|higher than)\s+(\d+(?:\.\d+)?)\s*(%)?", "above"),
+            (
+                r"\b(above|over|greater than|more than|higher than)\s+(\d+(?:\.\d+)?)\s*(%)?",
+                "above",
+            ),
             (r"\b(below|under|less than|lower than)\s+(\d+(?:\.\d+)?)\s*(%)?", "below"),
         ]
         for pattern, operator in patterns:

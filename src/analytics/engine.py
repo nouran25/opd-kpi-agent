@@ -78,7 +78,9 @@ class AnalyticsEngine:
             "timestamp": pd.Timestamp.now().isoformat(),
         }
 
-    def _current_previous_periods(self, df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    def _current_previous_periods(
+        self, df: pd.DataFrame
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
         latest_date = df["Date"].max()
         date_values = sorted(df["Date"].dropna().unique())
 
@@ -98,7 +100,18 @@ class AnalyticsEngine:
         if "%" in metric or "cr%" in metric_lower or "achievement" in metric_lower:
             return float(df[metric].mean())
 
-        if any(word in metric_lower for word in ["revenue", "losses", "cases", "booking", "services", "opportunity", "clinics"]):
+        if any(
+            word in metric_lower
+            for word in [
+                "revenue",
+                "losses",
+                "cases",
+                "booking",
+                "services",
+                "opportunity",
+                "clinics",
+            ]
+        ):
             return float(df[metric].sum())
 
         return float(df[metric].mean())
@@ -174,7 +187,18 @@ class AnalyticsEngine:
         if metric not in df.columns or df.empty:
             return pd.DataFrame()
 
-        if any(word in metric.lower() for word in ["revenue", "losses", "cases", "booking", "services", "opportunity", "clinics"]):
+        if any(
+            word in metric.lower()
+            for word in [
+                "revenue",
+                "losses",
+                "cases",
+                "booking",
+                "services",
+                "opportunity",
+                "clinics",
+            ]
+        ):
             ranking = df.groupby("Doctor Name")[metric].sum().reset_index()
         else:
             ranking = df.groupby("Doctor Name")[metric].mean().reset_index()
