@@ -16,6 +16,11 @@ class Config:
     llm_model: str = os.getenv("LLM_MODEL", "qwen2.5:7b")
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
     temperature: float = float(os.getenv("TEMPERATURE", "0.1"))
+    llm_num_ctx: int = int(os.getenv("LLM_NUM_CTX", "2048"))
+    llm_num_predict: int = int(os.getenv("LLM_NUM_PREDICT", "512"))
+    llm_num_thread: int = int(os.getenv("LLM_NUM_THREAD", str(os.cpu_count() or 4)))
+    llm_num_gpu: int = int(os.getenv("LLM_NUM_GPU", "0"))
+    llm_keep_alive: str = os.getenv("LLM_KEEP_ALIVE", "30m")
 
     # Ollama settings
     ollama_base_url: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
