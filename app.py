@@ -212,7 +212,9 @@ def create_web_interface(agent: OPDKpiAgent):
             {"role": "assistant", "content": response},
         ]
 
-    def submit_message(message, history, bu_filter, doctor_filter, year_filter, kpi_filter):
+    def submit_message(
+        message, history, bu_filter, doctor_filter, year_filter, kpi_filter
+    ):
         return "", respond(
             message,
             history,
