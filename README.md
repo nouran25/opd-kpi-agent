@@ -1,7 +1,3 @@
----
-title: OPD KPI Intelligence Agent
----
-
 # OPD KPI Intelligence Agent
 
 An interactive Gradio application for analyzing Outpatient Department (OPD) KPI performance across doctors, business units, time periods, and operational drivers.
