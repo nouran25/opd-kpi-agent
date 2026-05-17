@@ -205,6 +205,13 @@ class OPDKpiAgent:
             return self._fallback_response()
 
         try:
+            direct_response = self._direct_structured_response(user_input)
+            if direct_response:
+                self.chat_history.extend(
+                    [HumanMessage(user_input), AIMessage(direct_response)]
+                )
+                return direct_response
+
             messages = self.chat_history + [HumanMessage(user_input)]
             response = self.agent_executor.invoke({"messages": messages})
             output = self._message_content_to_text(response["messages"][-1])
@@ -212,6 +219,31 @@ class OPDKpiAgent:
             return output
         except Exception as exc:
             return f"Error: {exc}"
+
+    def _direct_structured_response(self, user_input: str) -> str | None:
+        """Answer common KPI requests deterministically from the loaded dataset."""
+        normalized = self.data.normalize_lookup_text(user_input)
+        doctor = self._extract_doctor_from_text(user_input)
+        bu = self._extract_bu_from_text(user_input)
+        year = self._extract_year_from_text(user_input)
+        month = self._extract_month_from_text(user_input)
+        metric = self.data.resolve_kpi(user_input)
+
+        asks_for_justification = any(
+            term in normalized
+            for term in ["justify", "justification", "explain", "why", "performance"]
+        )
+        if doctor and asks_for_justification:
+            if metric:
+                return self._format_doctor_kpi_justification(doctor, metric, bu=bu)
+            return self._format_doctor_kpi_profile(
+                doctor,
+                bu=bu,
+                year=year,
+                month=month,
+            )
+
+        return None
 
     def _format_root_cause(self, metric: str, bu: str | None = None) -> str:
         analysis = self.analytics.root_cause_analysis(metric, bu=bu)
@@ -320,7 +352,20 @@ Recommended actions:
         peer_df = self.data.df.copy()
         if bu:
             peer_df = peer_df[peer_df["BU"] == bu]
-        peer_value = self.analytics._aggregate_metric(peer_df, metric)
+        peer_current = peer_df[
+            (peer_df["Date"] == latest_date)
+            & ~(
+                peer_df["Doctor Name"].str.contains(
+                    doctor_name,
+                    case=False,
+                    na=False,
+                    regex=False,
+                )
+            )
+        ]
+        if peer_current.empty:
+            peer_current = current
+        peer_value = self._peer_doctor_metric_average(peer_current, metric)
 
         doctor_revenue = (
             float(df["Total Revenue"].sum()) if "Total Revenue" in df else 0
