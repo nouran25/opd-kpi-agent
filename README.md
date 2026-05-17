@@ -277,6 +277,43 @@ The app uses a hybrid approach:
 
 This keeps simple questions fast while preserving agent-style reasoning for more complex requests.
 
+### LangChain Flow
+
+```mermaid
+flowchart TD
+    A["User question in Gradio"] --> B["Apply selected filters"]
+    B --> C["OPDKpiAgent.chat"]
+    C --> D{"Direct structured match?"}
+
+    D -->|Yes| E["Resolve doctor / BU / KPI / date"]
+    E --> F["Pandas + AnalyticsEngine"]
+    F --> G["Grounded formatted answer"]
+
+    D -->|No| H["LangChain create_agent"]
+    H --> I["Groq ChatGroq model"]
+    I --> J{"Tool needed?"}
+    J -->|Yes| K["LangChain tool call"]
+    K --> L["Tool resolves KPI wording"]
+    L --> M["Dataframe / knowledge-base calculation"]
+    M --> N["Tool result returned to model"]
+    N --> O["Final natural-language answer"]
+
+    J -->|No| O
+    G --> P["Response shown in chat"]
+    O --> P
+
+    subgraph Tools["Available LangChain Tools"]
+      T1["get_doctor_performance"]
+      T2["analyze_root_cause"]
+      T3["compare_doctors"]
+      T4["compare_business_units"]
+      T5["get_kpi_trend"]
+      T6["get_bu_summary"]
+    end
+
+    K -. can call .-> Tools
+```
+
 ## Knowledge-Base Driven Analysis
 
 The agent uses the knowledge base to avoid inventing KPI relationships.
