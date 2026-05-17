@@ -62,7 +62,13 @@ RECOMMENDED_QUESTIONS = [
 
 APP_CSS = """
 body, .gradio-container {
-  background: #f6f8fb !important;
+  background:
+    radial-gradient(circle at top left, rgba(20, 184, 166, 0.16), transparent 34rem),
+    linear-gradient(135deg, #0b1117 0%, #10151d 48%, #16130f 100%) !important;
+  color: #e7eef7 !important;
+}
+.gradio-container {
+  min-height: 100vh;
 }
 .opd-shell {
   max-width: 1280px;
@@ -70,15 +76,15 @@ body, .gradio-container {
   padding: 18px;
 }
 .opd-hero {
-  border: 1px solid #dfe6ef;
-  background: #ffffff;
-  border-radius: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: linear-gradient(135deg, rgba(15, 23, 32, 0.94), rgba(24, 28, 31, 0.9));
+  border-radius: 12px;
   padding: 20px 22px;
-  box-shadow: 0 14px 35px rgba(22, 32, 51, 0.07);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34);
   margin-bottom: 14px;
 }
 .opd-kicker {
-  color: #0f766e;
+  color: #5eead4;
   font-size: 13px;
   font-weight: 700;
   letter-spacing: .08em;
@@ -86,14 +92,14 @@ body, .gradio-container {
   text-transform: uppercase;
 }
 .opd-title {
-  color: #162033;
+  color: #f8fafc;
   font-size: 30px;
   line-height: 1.15;
   font-weight: 760;
   margin: 0;
 }
 .opd-subtitle {
-  color: #607089;
+  color: #a9b6c8;
   font-size: 15px;
   line-height: 1.55;
   max-width: 780px;
@@ -106,69 +112,119 @@ body, .gradio-container {
   margin-top: 14px;
 }
 .opd-badge {
-  border: 1px solid #dfe6ef;
-  background: #f8fafc;
+  border: 1px solid rgba(94, 234, 212, 0.2);
+  background: rgba(15, 23, 42, 0.68);
   border-radius: 999px;
-  color: #334155;
+  color: #d9f7f2;
   font-size: 13px;
   font-weight: 650;
   padding: 6px 10px;
 }
 .opd-panel {
-  border: 1px solid #dfe6ef;
-  background: #ffffff;
-  border-radius: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: rgba(15, 23, 32, 0.88);
+  border-radius: 12px;
   padding: 14px;
-  box-shadow: 0 12px 28px rgba(22, 32, 51, 0.055);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.24);
 }
 .opd-panel-title {
-  color: #162033;
+  color: #f8fafc;
   font-size: 14px;
   font-weight: 760;
   margin: 0 0 10px;
 }
 .opd-panel-note {
-  color: #64748b;
+  color: #94a3b8;
   font-size: 12px;
   line-height: 1.45;
   margin: 8px 0 0;
 }
 #chatbot {
-  border: 1px solid #dfe6ef;
-  border-radius: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 12px;
   overflow: hidden;
-  box-shadow: 0 12px 30px rgba(22, 32, 51, 0.055);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+  background: rgba(8, 13, 20, 0.86) !important;
 }
 #prompt-box textarea {
-  border-radius: 12px !important;
+  border-radius: 10px !important;
   font-size: 15px !important;
 }
 .opd-chip {
   width: 100%;
-  border-radius: 12px !important;
-  border: 1px solid #dfe6ef !important;
-  background: #ffffff !important;
-  color: #162033 !important;
+  border-radius: 10px !important;
+  border: 1px solid rgba(148, 163, 184, 0.18) !important;
+  background: rgba(15, 23, 32, 0.92) !important;
+  color: #e7eef7 !important;
   justify-content: flex-start !important;
   text-align: left !important;
   min-height: 48px;
-  box-shadow: 0 8px 20px rgba(22, 32, 51, 0.05);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.2);
   white-space: normal !important;
 }
 .opd-chip:hover {
-  border-color: rgba(15, 118, 110, .55) !important;
-  box-shadow: 0 12px 26px rgba(15, 118, 110, 0.11);
+  border-color: rgba(45, 212, 191, .7) !important;
+  box-shadow: 0 14px 28px rgba(20, 184, 166, 0.14);
   transform: translateY(-1px);
 }
 .opd-input-row {
-  border: 1px solid #dfe6ef;
-  background: #ffffff;
-  border-radius: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: rgba(15, 23, 32, 0.9);
+  border-radius: 12px;
   padding: 12px;
-  box-shadow: 0 12px 30px rgba(22, 32, 51, 0.055);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.26);
 }
 .opd-toolbar button {
-  border-radius: 12px !important;
+  border-radius: 10px !important;
+}
+.gradio-container label,
+.gradio-container .label-wrap,
+.gradio-container .block-title,
+.gradio-container .form label {
+  color: #dbe7f5 !important;
+}
+.gradio-container input,
+.gradio-container textarea,
+.gradio-container select,
+.gradio-container .wrap,
+.gradio-container .container,
+.gradio-container .block,
+.gradio-container .form,
+.gradio-container .input-container {
+  background-color: rgba(9, 14, 22, 0.86) !important;
+  border-color: rgba(148, 163, 184, 0.2) !important;
+  color: #e7eef7 !important;
+}
+.gradio-container input::placeholder,
+.gradio-container textarea::placeholder {
+  color: #7f8ea3 !important;
+}
+.gradio-container button {
+  background: rgba(19, 27, 38, 0.96) !important;
+  border: 1px solid rgba(148, 163, 184, 0.22) !important;
+  color: #e7eef7 !important;
+}
+.gradio-container button:hover {
+  border-color: rgba(45, 212, 191, 0.62) !important;
+  color: #ffffff !important;
+}
+.gradio-container button.primary,
+#prompt-box button {
+  background: linear-gradient(135deg, #14b8a6, #0f766e) !important;
+  border-color: rgba(94, 234, 212, 0.52) !important;
+  color: #ffffff !important;
+}
+.message.user {
+  background: #123e3a !important;
+  color: #effffb !important;
+}
+.message.bot {
+  background: #151d28 !important;
+  color: #e7eef7 !important;
+}
+.prose,
+.prose * {
+  color: #e7eef7 !important;
 }
 footer {
   display: none !important;
@@ -375,15 +431,25 @@ def main():
 
     demo = create_web_interface(agent)
     server_port = find_available_port(config.server_port)
-    print(f"Launching web interface at http://{config.server_host}:{server_port}")
+    print(f"Launching web interface at http://127.0.0.1:{server_port}")
 
-    demo.launch(
-        server_name=config.server_host,
-        server_port=server_port,
-        share=False,
-        theme=gr.themes.Soft(),
-        css=APP_CSS,
-    )
+    launch_kwargs = {
+        "server_name": config.server_host,
+        "server_port": server_port,
+        "share": False,
+        "theme": gr.themes.Soft(
+            primary_hue="teal",
+            neutral_hue="slate",
+        ),
+        "css": APP_CSS,
+    }
+    try:
+        demo.launch(**launch_kwargs)
+    except ValueError as exc:
+        if "localhost is not accessible" not in str(exc):
+            raise
+        print("Localhost check failed; retrying with Gradio's share link.")
+        demo.launch(**{**launch_kwargs, "share": True})
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ setup(
         "scipy>=1.10.0",
         "openpyxl>=3.1.0",
         "langchain>=1.0.0",
-        "langchain-ollama>=1.0.0",
+        "langchain-groq>=1.0.0",
         "langchain-community>=0.4.0",
         "chromadb>=0.4.0",
         "gradio>=4.0.0",

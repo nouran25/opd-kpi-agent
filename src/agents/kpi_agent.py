@@ -9,7 +9,7 @@ from pathlib import Path
 from langchain.agents import create_agent
 from langchain.tools import tool
 from langchain_core.messages import AIMessage, HumanMessage
-from langchain_ollama import ChatOllama
+from langchain_groq import ChatGroq
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -43,22 +43,20 @@ class OPDKpiAgent:
         self._create_agent()
 
     def _init_llm(self):
-        """Initialize Ollama LLM."""
+        """Initialize hosted Groq LLM."""
         try:
-            self.llm = ChatOllama(
+            self.llm = ChatGroq(
                 model=self.config.llm_model,
                 temperature=self.config.temperature,
-                base_url=self.config.ollama_base_url,
-                num_ctx=self.config.llm_num_ctx,
-                num_predict=self.config.llm_num_predict,
-                num_thread=self.config.llm_num_thread,
-                num_gpu=self.config.llm_num_gpu,
-                keep_alive=self.config.llm_keep_alive,
+                max_tokens=self.config.llm_max_tokens,
+                reasoning_effort=self.config.llm_reasoning_effort,
+                timeout=self.config.llm_timeout,
+                max_retries=self.config.llm_max_retries,
             )
             print(f"LLM initialized: {self.config.llm_model}")
         except Exception as exc:
             print(f"LLM not available: {exc}")
-            print(f"Run: ollama pull {self.config.llm_model}")
+            print("Set GROQ_API_KEY in your environment and restart the agent.")
             self.llm = None
 
     def _create_agent(self):
@@ -96,8 +94,36 @@ class OPDKpiAgent:
             return self._format_doctor_comparison(resolved_metric, bu=bu)
 
         @tool
-        def get_kpi_trend(kpi_name: str, months: int = 6, bu_name: str = "") -> str:
-            """Get recent trend for a KPI. Optional bu_name can be ASH, SMH, or HJH."""
+        def compare_business_units(
+            metric: str,
+            bu_names: str = "",
+            year: str = "",
+            month: str = "",
+        ) -> str:
+            """Compare BUs by a KPI. bu_names can be comma-separated values such as ASH, SMH. Optional year is like 2025 and month is like March or 3."""
+            resolved_metric = self.data.resolve_kpi(metric)
+            if resolved_metric is None:
+                return self._unknown_metric_message(metric)
+
+            selected_bus = self._resolve_bu_list(bu_names)
+            if bu_names and not selected_bus:
+                return self._unknown_bu_message(bu_names)
+
+            return self._format_bu_comparison(
+                resolved_metric,
+                bus=selected_bus,
+                year=self._parse_year(year),
+                month=self._parse_month(month),
+            )
+
+        @tool
+        def get_kpi_trend(
+            kpi_name: str,
+            months: int = 12,
+            bu_name: str = "",
+            year: str = "",
+        ) -> str:
+            """Get monthly trend for a KPI. Optional bu_name can be ASH, SMH, or HJH. Optional year is like 2025. Leave bu_name empty for all BUs."""
             metric = self.data.resolve_kpi(kpi_name)
             if metric is None:
                 return self._unknown_metric_message(kpi_name)
@@ -106,7 +132,12 @@ class OPDKpiAgent:
             if bu_name and bu is None:
                 return self._unknown_bu_message(bu_name)
 
-            return self._format_kpi_trend(metric, months=months, bu=bu)
+            return self._format_kpi_trend(
+                metric,
+                months=months,
+                bu=bu,
+                year=self._parse_year(year),
+            )
 
         @tool
         def get_bu_summary(bu_name: str) -> str:
@@ -120,6 +151,7 @@ class OPDKpiAgent:
             get_doctor_performance,
             analyze_root_cause,
             compare_doctors,
+            compare_business_units,
             get_kpi_trend,
             get_bu_summary,
         ]
@@ -139,27 +171,36 @@ class OPDKpiAgent:
         return (
             "You are a professional OPD KPI Analytics Agent for healthcare "
             "operations.\n\n"
+            "Your role is to help users understand doctor performance, KPI trends, root causes, and recommended actions based on the OPD dataset and the KPI knowledge base.\n\n"
             "Rules:\n"
             "1. Use tools for all dataset questions. Never invent numbers.\n"
             "2. The tools resolve natural KPI wording through the loaded knowledge-base "
             "workbook and dataset columns.\n"
-            "3. If the user mentions a BU, pass it to the tool.\n"
-            "4. For root-cause questions, call analyze_root_cause.\n"
-            "5. Explain what the numbers mean operationally. Include drivers, "
+            "3. If the user asks to compare BUs such as ASH vs SMH, call compare_business_units, not compare_doctors.\n"
+            "4. If the user mentions a BU, year, or month, pass it to the tool.\n"
+            "5. For root-cause questions, call analyze_root_cause.\n"
+            "6. Do not assume a BU when the user does not provide one; leave bu_name empty so the tool uses all BUs.\n"
+            "7. Explain what the numbers mean operationally. Include drivers, "
             "risks, and next actions.\n"
-            "6. Keep answers concise but thorough: executive summary, evidence, "
+            "8. Keep answers concise but thorough: executive summary, evidence, "
             "interpretation, and recommendations.\n\n"
             f"Available BUs: {bus}.\n"
             f"Available doctors include: {doctors}.\n"
             f"Available KPI columns include: {kpis}."
+            "If a doctor isn't found, list available doctors from the dataset.\n"
+            "Available tools give you access to:\n"
+            "- Doctor performance summaries\n"
+            "- Root cause analysis with statistical variance\n"
+            "- Doctor comparisons on any metric\n"
+            "- KPI definitions and formulas\n"
+            "- Trend analysis over time\n"
+            "- BU-level summaries\n"
+            "- Comprehensive reports\n"
+            "Always respond in a professional, helpful manner."
         )
 
     def chat(self, user_input: str) -> str:
         """Process user message."""
-        direct_response = self._direct_analytics_response(user_input)
-        if direct_response:
-            return direct_response
-
         if self.agent_executor is None:
             return self._fallback_response()
 
@@ -171,73 +212,6 @@ class OPDKpiAgent:
             return output
         except Exception as exc:
             return f"Error: {exc}"
-
-    def _direct_analytics_response(self, user_input: str) -> str | None:
-        """Handle high-confidence analytics paths without waiting for the LLM loop."""
-        text = user_input.lower()
-        metric = self.data.resolve_kpi(user_input)
-        bu = self._extract_bu_from_text(user_input)
-        doctor = self._extract_doctor_from_text(user_input)
-        threshold_filter = self._extract_threshold_filter(user_input)
-        year = self._extract_year_from_text(user_input)
-
-        if metric and threshold_filter and "doctor" in text:
-            return self._format_doctors_by_threshold(
-                metric,
-                operator=threshold_filter["operator"],
-                threshold=threshold_filter["threshold"],
-                bu=bu,
-                year=year,
-            )
-
-        if (
-            doctor
-            and metric
-            and any(
-                term in text for term in ["justify", "explain", "performance", "why"]
-            )
-        ):
-            return self._format_doctor_kpi_justification(doctor, metric, bu=bu)
-
-        if doctor and any(
-            term in text
-            for term in ["justification", "justifications", "justify", "explain"]
-        ):
-            return self._format_doctor_kpi_profile(doctor, bu=bu, year=year)
-
-        if metric and any(
-            term in text for term in ["root cause", "root causes", "why", "analyze"]
-        ):
-            return self._format_root_cause(metric, bu=bu)
-
-        if metric and any(term in text for term in ["trend", "over time", "changed"]):
-            return self._format_kpi_trend(metric, bu=bu, year=year)
-
-        if (
-            metric
-            and any(term in text for term in ["compare", "across"])
-            and any(
-                term in text
-                for term in ["bu", "bus", "business unit", "business units"]
-            )
-        ):
-            return self._format_bu_comparison(metric, year=year)
-
-        if metric and any(
-            term in text for term in ["compare", "top", "rank", "which doctors"]
-        ):
-            return self._format_doctor_comparison(metric, bu=bu, year=year)
-
-        if metric and any(term in text for term in ["what", "show", "tell", "give"]):
-            return self._format_metric_overview(metric, bu=bu, year=year)
-
-        if doctor and any(term in text for term in ["performance", "summary", "show"]):
-            return self._format_doctor_performance(doctor)
-
-        if bu and "summary" in text:
-            return self._format_bu_summary(bu)
-
-        return None
 
     def _format_root_cause(self, metric: str, bu: str | None = None) -> str:
         analysis = self.analytics.root_cause_analysis(metric, bu=bu)
@@ -439,17 +413,27 @@ Recommended actions:
         months: int = 6,
         bu: str | None = None,
         year: int | None = None,
+        month: int | None = None,
     ) -> str:
-        months = max(1, min(int(months or 6), 24))
-        df = self._scoped_df(bu=bu, year=year)
-        df = df.sort_values("Date").tail(months)
-
+        df = self._scoped_df(bu=bu, year=year, month=month)
         if metric not in df.columns:
             return self._unknown_metric_message(metric)
+        if df.empty:
+            return f"No trend data for {metric}{self._scope_text(bu=bu, year=year, month=month)}"
 
-        trend_data = df[["YearMonth", metric]].dropna()
+        aggregate = "sum" if self._is_additive_metric(metric) else "mean"
+        trend_data = (
+            df.dropna(subset=["YearMonth", metric])
+            .groupby("YearMonth", as_index=False)[metric]
+            .agg(aggregate)
+            .sort_values("YearMonth")
+        )
         if trend_data.empty:
-            return f"No trend data for {metric}{' in ' + bu if bu else ''}"
+            return f"No trend data for {metric}{self._scope_text(bu=bu, year=year, month=month)}"
+
+        if not year and not month:
+            months = max(1, min(int(months or 12), 24))
+            trend_data = trend_data.tail(months)
 
         first = float(trend_data[metric].iloc[0])
         last = float(trend_data[metric].iloc[-1])
@@ -457,9 +441,13 @@ Recommended actions:
         direction = (
             "Increasing" if change > 5 else "Decreasing" if change < -5 else "Stable"
         )
-        scope = self._scope_text(bu=bu, year=year)
+        scope = self._scope_text(bu=bu, year=year, month=month)
 
-        lines = [f"{direction} trend for {metric}{scope} (change: {change:+.1f}%)", ""]
+        lines = [
+            f"{direction} monthly trend for {metric}{scope} (change: {change:+.1f}%)",
+            f"Aggregation: {aggregate}",
+            "",
+        ]
         for _, row in trend_data.iterrows():
             lines.append(
                 f"{row['YearMonth']}: {self._format_metric_value(metric, row[metric])}"
@@ -471,8 +459,9 @@ Recommended actions:
         metric: str,
         bu: str | None = None,
         year: int | None = None,
+        month: int | None = None,
     ) -> str:
-        df = self._scoped_df(bu=bu, year=year)
+        df = self._scoped_df(bu=bu, year=year, month=month)
         if metric not in df.columns or df.empty:
             return f"No data for metric: {metric}"
 
@@ -485,7 +474,7 @@ Recommended actions:
             else 0
         )
         metadata = self.data.get_kpi_metadata(metric)
-        scope = self._scope_text(bu=bu, year=year)
+        scope = self._scope_text(bu=bu, year=year, month=month)
 
         lines = [
             f"KPI Overview: {metric}{scope}",
@@ -513,8 +502,9 @@ Recommended actions:
         metric: str,
         bu: str | None = None,
         year: int | None = None,
+        month: int | None = None,
     ) -> str:
-        df = self._scoped_df(bu=bu, year=year)
+        df = self._scoped_df(bu=bu, year=year, month=month)
         if metric not in df.columns or df.empty:
             return f"No data for metric: {metric}"
 
@@ -531,7 +521,7 @@ Recommended actions:
         if ranking.empty:
             return f"No data for metric: {metric}"
 
-        scope = self._scope_text(bu=bu, year=year)
+        scope = self._scope_text(bu=bu, year=year, month=month)
         lines = [f"Top doctors by {metric}{scope}:"]
         for _, row in ranking.iterrows():
             lines.append(
@@ -540,8 +530,16 @@ Recommended actions:
             )
         return "\n".join(lines)
 
-    def _format_bu_comparison(self, metric: str, year: int | None = None) -> str:
-        df = self._scoped_df(year=year)
+    def _format_bu_comparison(
+        self,
+        metric: str,
+        year: int | None = None,
+        month: int | None = None,
+        bus: list[str] | None = None,
+    ) -> str:
+        df = self._scoped_df(year=year, month=month)
+        if bus:
+            df = df[df["BU"].isin(bus)]
         if metric not in df.columns or df.empty:
             return f"No data for metric: {metric}"
 
@@ -552,7 +550,7 @@ Recommended actions:
             ranking = df.groupby("BU")[metric].mean().reset_index()
 
         ranking = ranking.sort_values(metric, ascending=False).reset_index(drop=True)
-        scope = self._scope_text(year=year)
+        scope = self._scope_text(year=year, month=month)
         best = ranking.iloc[0]
         worst = ranking.iloc[-1]
 
@@ -561,10 +559,11 @@ Recommended actions:
             "",
             "Executive readout:",
             (
-                f"{best['BU']} has the highest {metric} at "
-                f"{self._format_metric_value(metric, best[metric])}, while "
-                f"{worst['BU']} has the lowest at "
+                f"{best['BU']} is higher at "
+                f"{self._format_metric_value(metric, best[metric])}; "
+                f"{worst['BU']} is lower at "
                 f"{self._format_metric_value(metric, worst[metric])}. "
+                f"The gap is {self._format_metric_value(metric, best[metric] - worst[metric])}. "
                 f"This comparison uses {aggregate} aggregation based on the metric type."
             ),
             "",
@@ -592,8 +591,9 @@ Recommended actions:
         threshold: float,
         bu: str | None = None,
         year: int | None = None,
+        month: int | None = None,
     ) -> str:
-        df = self._scoped_df(bu=bu, year=year)
+        df = self._scoped_df(bu=bu, year=year, month=month)
         if metric not in df.columns or df.empty:
             return f"No data for metric: {metric}"
         if ("%" in metric or "cr%" in metric.lower()) and threshold > 1:
@@ -615,7 +615,7 @@ Recommended actions:
             )
             phrase = "below"
 
-        scope = self._scope_text(bu=bu, year=year)
+        scope = self._scope_text(bu=bu, year=year, month=month)
         threshold_text = self._format_metric_value(metric, threshold)
         if result.empty:
             return f"No doctors have {metric} {phrase} {threshold_text}{scope}."
@@ -700,8 +700,9 @@ Doctor: {doctor_name}
         doctor_name: str,
         bu: str | None = None,
         year: int | None = None,
+        month: int | None = None,
     ) -> str:
-        df = self._scoped_df(bu=bu, year=year)
+        df = self._scoped_df(bu=bu, year=year, month=month)
         df_doctor = df[
             df["Doctor Name"].str.contains(
                 doctor_name,
@@ -711,7 +712,7 @@ Doctor: {doctor_name}
             )
         ].copy()
         if df_doctor.empty:
-            scope = self._scope_text(bu=bu, year=year)
+            scope = self._scope_text(bu=bu, year=year, month=month)
             return (
                 f"Doctor '{doctor_name}' not found{scope}. Available doctors: "
                 f"{', '.join(self.data.get_doctor_list()[:10])}"
@@ -740,7 +741,7 @@ Doctor: {doctor_name}
         ]
         kpis = [metric for metric in kpi_candidates if metric in df_doctor.columns]
 
-        scope = self._scope_text(bu=bu, year=year)
+        scope = self._scope_text(bu=bu, year=year, month=month)
         lines = [
             f"Doctor KPI Performance and Justification: Dr. {doctor_name}{scope}",
             "",
@@ -980,22 +981,28 @@ Doctor: {doctor_name}
         self,
         bu: str | None = None,
         year: int | None = None,
+        month: int | None = None,
     ):
         df = self.data.df.copy()
         if bu:
             df = df[df["BU"] == bu]
         if year and "Year" in df.columns:
             df = df[df["Year"].astype("Int64") == year]
+        if month and "Month_Num" in df.columns:
+            df = df[df["Month_Num"].astype("Int64") == month]
         return df
 
     def _scope_text(
         self,
         bu: str | None = None,
         year: int | None = None,
+        month: int | None = None,
     ) -> str:
         parts = []
         if bu:
             parts.append(str(bu))
+        if month:
+            parts.append(self._month_name(month))
         if year:
             parts.append(str(year))
         return f" in {' / '.join(parts)}" if parts else ""
@@ -1024,6 +1031,54 @@ Doctor: {doctor_name}
             return None
         return int(match.group(1))
 
+    def _parse_year(self, value: str | int | None) -> int | None:
+        if value in (None, ""):
+            return None
+        match = re.search(r"\b(20\d{2})\b", str(value))
+        return int(match.group(1)) if match else None
+
+    def _parse_month(self, value: str | int | None) -> int | None:
+        if value in (None, ""):
+            return None
+        value_text = str(value).strip()
+        if value_text.isdigit():
+            month = int(value_text)
+            return month if 1 <= month <= 12 else None
+        return self._extract_month_from_text(value_text)
+
+    def _extract_month_from_text(self, text: str) -> int | None:
+        month_lookup = {
+            "january": 1,
+            "jan": 1,
+            "february": 2,
+            "feb": 2,
+            "march": 3,
+            "mar": 3,
+            "april": 4,
+            "apr": 4,
+            "may": 5,
+            "june": 6,
+            "jun": 6,
+            "july": 7,
+            "jul": 7,
+            "august": 8,
+            "aug": 8,
+            "september": 9,
+            "sep": 9,
+            "sept": 9,
+            "october": 10,
+            "oct": 10,
+            "november": 11,
+            "nov": 11,
+            "december": 12,
+            "dec": 12,
+        }
+        normalized = self.data.normalize_lookup_text(text)
+        for word in normalized.split():
+            if word in month_lookup:
+                return month_lookup[word]
+        return None
+
     def _extract_threshold_filter(self, text: str) -> dict | None:
         """Extract threshold filters such as above 20% or below 10."""
         patterns = [
@@ -1046,11 +1101,49 @@ Doctor: {doctor_name}
         return None
 
     def _extract_bu_from_text(self, text: str) -> str | None:
-        lowered = text.lower()
+        bus = self._extract_bus_from_text(text)
+        return bus[0] if bus else None
+
+    def _extract_bus_from_text(self, text: str) -> list[str]:
+        normalized = f" {self.data.normalize_lookup_text(text)} "
+        matches = []
         for bu in self.data.get_bu_list():
-            if str(bu).lower() in lowered:
-                return bu
-        return None
+            bu_normalized = self.data.normalize_lookup_text(bu)
+            if f" {bu_normalized} " in normalized:
+                matches.append(bu)
+        return matches
+
+    def _resolve_bu_list(self, value: str) -> list[str]:
+        if not value or not str(value).strip():
+            return []
+        selected = []
+        for part in re.split(r"[,;/|]|\band\b|\bvs\b|\bversus\b", str(value), flags=re.IGNORECASE):
+            resolved = self.data.resolve_bu(part.strip())
+            if resolved and resolved not in selected:
+                selected.append(resolved)
+        if selected:
+            return selected
+        resolved = self.data.resolve_bu(value)
+        return [resolved] if resolved else []
+
+    @staticmethod
+    def _month_name(month: int) -> str:
+        names = [
+            "",
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ]
+        return names[month] if 1 <= month <= 12 else str(month)
 
     def _extract_doctor_from_text(self, text: str) -> str | None:
         lowered = text.lower()
@@ -1112,8 +1205,8 @@ Doctor: {doctor_name}
 Agent running in basic mode because the LLM is not available.
 
 To enable full AI capabilities:
-1. Install Ollama: https://ollama.com
-2. Run: ollama pull {self.config.llm_model}
+1. Create a Groq API key: https://console.groq.com/keys
+2. Set GROQ_API_KEY in your environment
 3. Restart the agent
 
 Currently loaded: {len(self.data.df)} records, {len(self.data.get_doctor_list())} doctors.

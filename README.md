@@ -2,7 +2,7 @@
 
 An interactive Gradio application for analyzing Outpatient Department (OPD) KPI performance across doctors, business units, time periods, and operational drivers.
 
-The app combines a structured analytics engine with an Ollama-powered LangChain agent. Fast, high-confidence KPI questions are answered directly from the dataset, while broader natural-language questions can use the local LLM and the available analytical tools.
+The app combines a structured analytics engine with a Groq-powered LangChain agent. Fast, high-confidence KPI questions are answered directly from the dataset, while broader natural-language questions can use the hosted LLM and the available analytical tools.
 
 ## Features
 
@@ -13,7 +13,7 @@ The app combines a structured analytics engine with an Ollama-powered LangChain 
 - KPI trend analysis over time
 - Threshold questions such as doctors above a no-show rate
 - Natural-language KPI resolution, for example `service leakage`, `PMS`, or `patient retention`
-- Local Ollama support for agentic reasoning without sending data to external APIs
+- Groq-hosted LLM support for faster agentic reasoning without running a model locally
 
 ## Example Questions
 
@@ -73,7 +73,7 @@ Main intelligence layer for the application.
 
 Responsibilities:
 
-- Initializes the data loader, analytics engine, Ollama model, and LangChain agent
+- Initializes the data loader, analytics engine, Groq model, and LangChain agent
 - Routes simple structured questions to fast dataframe-based answers
 - Uses LangChain tools for more open-ended agent responses
 - Formats professional responses with executive readouts, evidence, drivers, and recommendations
@@ -125,7 +125,7 @@ Central configuration file.
 Responsibilities:
 
 - Defines model settings
-- Defines Ollama connection settings
+- Defines hosted LLM settings
 - Defines data paths
 - Defines default analysis thresholds
 - Defines Gradio host and port
@@ -144,7 +144,7 @@ Main libraries:
 - `scipy`
 - `openpyxl`
 - `langchain`
-- `langchain-ollama`
+- `langchain-groq`
 - `chromadb`
 
 ### `setup.py`
@@ -183,37 +183,35 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 3. Install Ollama
+### 3. Create a Groq API key
 
-Download and install Ollama from:
+Create an API key from:
 
 ```text
-https://ollama.com
+https://console.groq.com/keys
 ```
 
-### 4. Pull the configured model
-
-The default model is `qwen2.5:7b`.
+Then set it in your terminal:
 
 ```powershell
-ollama pull qwen2.5:7b
+$env:GROQ_API_KEY="your_api_key_here"
 ```
 
-### 5. Start Ollama
+The default Groq model is `openai/gpt-oss-120b` with `medium` reasoning effort.
 
-Make sure Ollama is running before launching the app.
-
-You can test it with:
-
-```powershell
-ollama list
-```
-
-### 6. Run the app
+### 4. Run the app
 
 ```powershell
 python app.py
 ```
+
+For a persistent Windows user environment variable, use:
+
+```powershell
+setx GROQ_API_KEY "your_api_key_here"
+```
+
+Restart your terminal after using `setx`.
 
 By default, the app launches on:
 
@@ -235,21 +233,21 @@ Common environment variables:
 
 | Variable | Default | Description |
 |---|---:|---|
-| `LLM_MODEL` | `qwen2.5:7b` | Ollama model name |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
-| `TEMPERATURE` | `0.1` | LLM response randomness |
-| `LLM_NUM_CTX` | `2048` | Ollama context window |
-| `LLM_NUM_PREDICT` | `512` | Maximum generated tokens |
-| `LLM_NUM_THREAD` | CPU count | CPU threads used by Ollama |
-| `LLM_NUM_GPU` | `0` | GPU layers used by Ollama |
-| `LLM_KEEP_ALIVE` | `30m` | How long Ollama keeps the model loaded |
+| `GROQ_API_KEY` | Required | Groq API key |
+| `LLM_MODEL` | `openai/gpt-oss-120b` | Groq model name |
+| `LLM_REASONING_EFFORT` | `medium` | Reasoning effort for GPT-OSS models: `low`, `medium`, or `high` |
+| `TEMPERATURE` | `0.0` | LLM response randomness |
+| `LLM_MAX_TOKENS` | `1024` | Maximum generated tokens |
+| `LLM_TIMEOUT` | `60` | LLM request timeout in seconds |
+| `LLM_MAX_RETRIES` | `2` | LLM request retry count |
 
 Example:
 
 ```powershell
-$env:LLM_MODEL="qwen2.5:7b"
-$env:LLM_NUM_CTX="2048"
-$env:LLM_NUM_PREDICT="512"
+$env:GROQ_API_KEY="your_api_key_here"
+$env:LLM_MODEL="openai/gpt-oss-120b"
+$env:LLM_REASONING_EFFORT="medium"
+$env:LLM_MAX_TOKENS="1024"
 python app.py
 ```
 
@@ -266,7 +264,7 @@ The app uses a hybrid approach:
    - threshold
    - requested operation
 3. If the question maps clearly to a known analytics operation, the app answers directly from the dataframe.
-4. If the question is broader or ambiguous, the agent can use Ollama and LangChain tools.
+4. If the question is broader or ambiguous, the agent can use Groq and LangChain tools.
 
 This keeps simple questions fast while preserving agent-style reasoning for more complex requests.
 
@@ -295,18 +293,18 @@ If you see an import error, reinstall dependencies:
 pip install -r requirements.txt --upgrade
 ```
 
-### Ollama connection error
+### Groq API key error
 
-Confirm Ollama is running:
+Confirm `GROQ_API_KEY` is set in the same terminal where you run the app:
 
 ```powershell
-ollama list
+echo $env:GROQ_API_KEY
 ```
 
-Then confirm the model exists:
+Then restart the app. You can also choose a different Groq model:
 
 ```powershell
-ollama pull qwen2.5:7b
+$env:LLM_MODEL="openai/gpt-oss-120b"
 ```
 
 ### Very slow answers
@@ -325,17 +323,6 @@ instead of:
 Tell me about retention
 ```
 
-### Ollama crashes
-
-If Ollama crashes because of GPU issues, force CPU mode:
-
-```powershell
-setx CUDA_VISIBLE_DEVICES -1
-setx GPU_DEVICE_ORDINAL -1
-```
-
-Restart your terminal after running those commands.
-
 ### Data file not found
 
 Make sure these files exist:
@@ -349,7 +336,7 @@ Also confirm that the OPD workbook contains the `OPD_KPI_Dataset` sheet.
 
 ## Privacy Notes
 
-This project is designed for local execution. When using local Ollama, dataset content stays on your machine.
+This project runs the app locally, but Groq inference is hosted. Any text sent to the LLM API is processed by Groq, so avoid sending private healthcare, doctor, patient, or operational details unless that is acceptable for your environment.
 
 Do not publish private healthcare, doctor, patient, or operational data to a public repository. If the Excel files contain confidential information, keep the repository private or remove/anonymize the files before sharing.
 

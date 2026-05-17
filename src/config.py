@@ -4,8 +4,12 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 # Project root
 PROJECT_ROOT = Path(__file__).parent.parent
+
+load_dotenv(PROJECT_ROOT / ".env")
 
 
 @dataclass
@@ -13,17 +17,13 @@ class Config:
     """Agent configuration"""
 
     # Model settings
-    llm_model: str = os.getenv("LLM_MODEL", "qwen2.5:7b")
+    llm_model: str = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
-    temperature: float = float(os.getenv("TEMPERATURE", "0.1"))
-    llm_num_ctx: int = int(os.getenv("LLM_NUM_CTX", "2048"))
-    llm_num_predict: int = int(os.getenv("LLM_NUM_PREDICT", "512"))
-    llm_num_thread: int = int(os.getenv("LLM_NUM_THREAD", str(os.cpu_count() or 4)))
-    llm_num_gpu: int = int(os.getenv("LLM_NUM_GPU", "0"))
-    llm_keep_alive: str = os.getenv("LLM_KEEP_ALIVE", "30m")
-
-    # Ollama settings
-    ollama_base_url: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    temperature: float = float(os.getenv("TEMPERATURE", "0.0"))
+    llm_max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "1024"))
+    llm_timeout: int = int(os.getenv("LLM_TIMEOUT", "60"))
+    llm_max_retries: int = int(os.getenv("LLM_MAX_RETRIES", "2"))
+    llm_reasoning_effort: str = os.getenv("LLM_REASONING_EFFORT", "medium")
 
     # Data paths
     dataset_path: Path = PROJECT_ROOT / "data" / "OPD dataset.xlsx"
@@ -39,7 +39,7 @@ class Config:
     retention_threshold: float = 0.60
 
     # Web server
-    server_host: str = "0.0.0.0"
+    server_host: str = os.getenv("SERVER_HOST", "127.0.0.1")
     server_port: int = 7860
 
     def ensure_directories(self):
