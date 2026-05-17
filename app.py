@@ -424,19 +424,21 @@ def find_available_port(start_port: int, attempts: int = 20) -> int:
     return start_port
 
 
-def main():
-    print("OPD KPI Intelligence Agent")
-    print("Initializing agent...")
-    agent = OPDKpiAgent()
+print("OPD KPI Intelligence Agent")
+print("Initializing agent...")
+agent = OPDKpiAgent()
+demo = create_web_interface(agent)
 
-    demo = create_web_interface(agent)
+
+def main():
     server_port = find_available_port(config.server_port)
-    print(f"Launching web interface at http://127.0.0.1:{server_port}")
+    print(f"Launching web interface at http://{config.server_host}:{server_port}")
 
     launch_kwargs = {
         "server_name": config.server_host,
         "server_port": server_port,
         "share": False,
+        "ssr_mode": False,
         "theme": gr.themes.Soft(
             primary_hue="teal",
             neutral_hue="slate",

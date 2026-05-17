@@ -39,7 +39,8 @@ class Config:
     retention_threshold: float = 0.60
 
     # Web server
-    server_host: str = os.getenv("SERVER_HOST", "127.0.0.1")
+    default_server_host = "0.0.0.0" if os.getenv("SPACE_ID") else "127.0.0.1"
+    server_host: str = os.getenv("SERVER_HOST", default_server_host)
     server_port: int = 7860
 
     def ensure_directories(self):

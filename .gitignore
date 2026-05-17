@@ -24,6 +24,12 @@ Thumbs.db
 
 # Logs
 *.log
+*.err.log
+
+# Local archives / exports
+*.rar
+*.zip
+*.pbix
 
 # Environment
 .env

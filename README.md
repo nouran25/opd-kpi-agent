@@ -1,3 +1,12 @@
+---
+title: OPD KPI Intelligence Agent
+colorFrom: teal
+colorTo: slate
+sdk: gradio
+app_file: app.py
+pinned: false
+---
+
 # OPD KPI Intelligence Agent
 
 An interactive Gradio application for analyzing Outpatient Department (OPD) KPI performance across doctors, business units, time periods, and operational drivers.
