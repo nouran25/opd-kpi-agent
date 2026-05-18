@@ -99,26 +99,48 @@ Do not upload `data/chroma_DB/` or `data/chroma_db/` to Hugging Face or Git. It 
 ## Application Flow
 
 ```mermaid
-flowchart TD
+flowchart TB
     A["User question in Gradio"] --> B["Apply optional UI filters"]
     B --> C["OPDKpiAgent.chat"]
-    C --> D{"Direct structured route?"}
 
-    D -->|Dataset KPI question| E["Pandas + AnalyticsEngine"]
-    E --> F["Exact numeric answer"]
+    C --> D{"Can the app answer directly?"}
 
-    D -->|Knowledge-base question| G["ChromaDB RAG"]
-    G --> H["Definitions / formulas / owners / playbooks"]
-    H --> F
+    subgraph Direct["Fast deterministic routes"]
+        direction TB
+        D -->|Yes| Y{"Which direct route?"}
 
-    D -->|Broader question| I["LangChain agent"]
-    I --> J["Groq ChatGroq model"]
-    J --> K["Tool calls when needed"]
-    K --> E
-    K --> G
+        Y -->|Dataset KPI question| E["Pandas + AnalyticsEngine"]
+        E --> F["Exact numbers, comparisons, trends, thresholds, root causes"]
 
-    F --> L["Response shown in chat"]
-    J --> L
+        Y -->|Knowledge-base question| G["ChromaDB RAG"]
+        G --> H["Definitions, formulas, owners, drivers, playbooks"]
+    end
+
+    D -->|No| I["LangChain create_agent"]
+
+    subgraph Agent["LangChain agent route"]
+        direction TB
+        I --> J["Groq ChatGroq model"]
+        J --> K{"Does the model need a tool?"}
+        K -->|No| N["Model response"]
+        K -->|Yes| M["LangChain imported tools"]
+    end
+
+    subgraph Tools["Available tools"]
+        direction TB
+        TData["Dataset tools<br/>get_doctor_performance<br/>analyze_root_cause<br/>compare_doctors<br/>compare_business_units<br/>get_kpi_trend<br/>get_bu_summary"]
+        TRag["Knowledge tool<br/>search_kpi_knowledge"]
+    end
+
+    M --> TData
+    M --> TRag
+
+    TData --> E
+    TRag --> G
+
+    F --> L["Formatted response shown in chat"]
+    H --> L
+    N --> L
 ```
 
 ## Core Modules
