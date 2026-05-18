@@ -301,6 +301,19 @@ class OPDKpiAgent:
                 "recommendation",
             ]
         )
+        asks_for_kpi_overview = any(
+            term in normalized
+            for term in [
+                "tell me about",
+                "overview",
+                "in general",
+                "what is",
+                "describe",
+            ]
+        )
+
+        if asks_for_knowledge and metric is None:
+            return self._unknown_knowledge_kpi_message(user_input)
 
         if metric and asks_for_root_cause and not normalized.startswith("search"):
             root_cause = self._format_root_cause(metric, bu=bu)
@@ -310,6 +323,9 @@ class OPDKpiAgent:
             return root_cause
 
         if metric and asks_for_knowledge:
+            return self._format_kpi_knowledge_lookup(metric, user_input)
+
+        if metric and asks_for_kpi_overview:
             return self._format_kpi_knowledge_lookup(metric, user_input)
 
         if doctor and asks_for_justification:
@@ -1580,6 +1596,31 @@ Doctor: {doctor_label}
             f"KPI '{metric_name}' was not found. Available KPI examples: "
             f"{', '.join(self._available_kpi_columns()[:20])}"
         )
+
+    def _unknown_knowledge_kpi_message(self, query: str) -> str:
+        suggestions = self._knowledge_kpi_suggestions(query)
+        suggestion_text = (
+            f" Closest available KPI(s): {', '.join(suggestions)}."
+            if suggestions
+            else ""
+        )
+        return (
+            "I could not find that KPI in the loaded dataset or KPI knowledge base, "
+            "so I should not provide a definition or formula for it as if it were "
+            f"configured.{suggestion_text}"
+        )
+
+    def _knowledge_kpi_suggestions(self, query: str) -> list[str]:
+        normalized_query = set(self.data.normalize_lookup_text(query).split())
+        scored = []
+        for metric in self._available_kpi_columns():
+            normalized_metric = set(self.data.normalize_lookup_text(metric).split())
+            overlap = len(normalized_query & normalized_metric)
+            if overlap:
+                scored.append((overlap, metric))
+
+        scored.sort(reverse=True)
+        return [metric for _, metric in scored[:5]]
 
     def _unknown_bu_message(self, bu_name: str) -> str:
         return f"BU '{bu_name}' not found. Available BUs: {', '.join(self.data.get_bu_list())}"
