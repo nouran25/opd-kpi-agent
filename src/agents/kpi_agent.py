@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.analytics.engine import AnalyticsEngine
 from src.config import config
 from src.data.loader import OPDDataLoader
+from src.data.vector_store import KPIKnowledgeVectorStore
 
 
 class OPDKpiAgent:
@@ -34,6 +35,7 @@ class OPDKpiAgent:
         print("Loading data...")
         self.data = OPDDataLoader(self.config).load_all()
         self.analytics = AnalyticsEngine(self.data)
+        self.knowledge_store = self._init_knowledge_store()
 
         self.llm = None
         self.agent_executor = None
@@ -58,6 +60,20 @@ class OPDKpiAgent:
             print(f"LLM not available: {exc}")
             print("Set GROQ_API_KEY in your environment and restart the agent.")
             self.llm = None
+
+    def _init_knowledge_store(self) -> KPIKnowledgeVectorStore | None:
+        """Initialize and populate the persistent Chroma knowledge store."""
+        try:
+            store = KPIKnowledgeVectorStore(self.config, self.data)
+            indexed_count = store.sync()
+            print(
+                "Chroma knowledge store ready: "
+                f"{indexed_count} documents at {self.config.vector_store_path}"
+            )
+            return store
+        except Exception as exc:
+            print(f"Chroma knowledge store not available: {exc}")
+            return None
 
     def _create_agent(self):
         """Create the LangChain agent and expose safe analytical tools."""
@@ -147,6 +163,11 @@ class OPDKpiAgent:
                 return self._unknown_bu_message(bu_name)
             return self._format_bu_summary(bu)
 
+        @tool
+        def search_kpi_knowledge(query: str) -> str:
+            """Search the Chroma KPI knowledge base for definitions, formulas, relationships, investigation steps, and recommended actions."""
+            return self._search_kpi_knowledge(query)
+
         tools = [
             get_doctor_performance,
             analyze_root_cause,
@@ -154,6 +175,7 @@ class OPDKpiAgent:
             compare_business_units,
             get_kpi_trend,
             get_bu_summary,
+            search_kpi_knowledge,
         ]
 
         if self.llm:
@@ -180,22 +202,25 @@ class OPDKpiAgent:
             "4. If the user mentions a BU, year, or month, pass it to the tool.\n"
             "5. For root-cause questions, call analyze_root_cause.\n"
             "6. Do not assume a BU when the user does not provide one; leave bu_name empty so the tool uses all BUs.\n"
-            "7. Explain what the numbers mean operationally. Include drivers, "
+            "7. Use search_kpi_knowledge when the user asks about KPI definitions, "
+            "formulas, playbooks, relationships, recommended actions, or a KPI "
+            "whose wording does not resolve cleanly to a dataset column.\n"
+            "8. Explain what the numbers mean operationally. Include drivers, "
             "risks, and next actions.\n"
-            "8. Keep answers concise but thorough: executive summary, evidence, "
+            "9. Keep answers concise but thorough: executive summary, evidence, "
             "interpretation, and recommendations.\n"
-            "9. Stay within the 1024-token response limit and finish cleanly. Target "
+            "10. Stay within the 1024-token response limit and finish cleanly. Target "
             "350-500 words, or 250-400 words when using a table.\n"
-            "10. Use tables when they improve clarity, especially for month-by-month "
+            "11. Use tables when they improve clarity, especially for month-by-month "
             "trends, BU comparisons, doctor comparisons, or driver snapshots. Avoid "
             "tables for simple narrative explanations.\n"
-            "11. Keep tables compact: use at most one table unless the user explicitly "
+            "12. Keep tables compact: use at most one table unless the user explicitly "
             "asks for detailed tables, include only the most useful columns, and avoid "
             "wide tables with long text inside cells.\n"
-            "12. Format recommendations as a numbered action list with short bullets "
+            "13. Format recommendations as a numbered action list with short bullets "
             "under each action when useful. Prefer 3 practical recommendations; use "
             "5 only when no table is included or the user asks for depth.\n"
-            "13. If space is limited, prioritize the conclusion, the most important "
+            "14. If space is limited, prioritize the conclusion, the most important "
             "evidence, and actionable recommendations over extra explanation.\n\n"
             f"Available BUs: {bus}.\n"
             f"Available doctors include: {doctors}.\n"
@@ -206,6 +231,7 @@ class OPDKpiAgent:
             "- Root cause analysis with statistical variance\n"
             "- Doctor comparisons on any metric\n"
             "- KPI definitions and formulas\n"
+            "- Semantic Chroma search over the KPI knowledge base\n"
             "- Trend analysis over time\n"
             "- BU-level summaries\n"
             "- Comprehensive reports\n"
@@ -246,6 +272,41 @@ class OPDKpiAgent:
             term in normalized
             for term in ["justify", "justification", "explain", "why", "performance"]
         )
+        asks_for_root_cause = any(
+            term in normalized
+            for term in [
+                "root cause",
+                "root causes",
+                "causing",
+                "cause of",
+                "why",
+            ]
+        )
+        asks_for_knowledge = any(
+            term in normalized
+            for term in [
+                "knowledge base",
+                "knowledgebase",
+                "definition",
+                "formula",
+                "owner",
+                "business question",
+                "investigation",
+                "playbook",
+                "recommended action",
+                "recommendation",
+            ]
+        )
+
+        if metric and asks_for_root_cause and not normalized.startswith("search"):
+            root_cause = self._format_root_cause(metric, bu=bu)
+            if asks_for_knowledge:
+                knowledge = self._format_kpi_knowledge_lookup(metric, user_input)
+                return f"{root_cause}\n\n{knowledge}"
+            return root_cause
+
+        if metric and asks_for_knowledge:
+            return self._format_kpi_knowledge_lookup(metric, user_input)
 
         if doctor and asks_for_justification:
             if metric:
@@ -258,6 +319,96 @@ class OPDKpiAgent:
             )
 
         return None
+
+    def _format_kpi_knowledge_lookup(self, metric: str, query: str) -> str:
+        metadata = self.data.get_kpi_metadata(metric)
+        relationships = self.data.get_kpi_relationships(metric)
+        playbook = self.data.get_playbook(metric)
+        source_summary = self._kpi_knowledge_source_summary(metric)
+
+        details = [
+            f"KPI Knowledge Lookup: {metric}",
+            "",
+            "Knowledge-base fields:",
+            f"- Owner: {metadata.get('KPI_Owner_Role', 'Not configured')}",
+            f"- Function owner: {metadata.get('Function_Owner', 'Not configured')}",
+            f"- Business question: {metadata.get('Business_Question', 'Not configured')}",
+            f"- Formula: {metadata.get('Formula_Logic', metadata.get('Financial_Impact_Formula', 'Not configured'))}",
+            f"- Primary driver: {metadata.get('Primary_Driver_KPI', 'Not configured')}",
+            f"- Secondary driver: {metadata.get('Secondary_Driver_KPI', 'Not configured')}",
+            "",
+            "Investigation steps:",
+            self._format_list(
+                [
+                    metadata.get("Investigation_Step_1", ""),
+                    metadata.get("Investigation_Step_2", ""),
+                    metadata.get("Investigation_Step_3", ""),
+                    metadata.get("Investigation_Step_4", ""),
+                ]
+            ),
+        ]
+
+        if not relationships.empty:
+            details.extend(["", "Mapped relationships:"])
+            for _, row in relationships.head(5).iterrows():
+                child = row.get("Child_KPI", "Unknown driver")
+                relationship = (
+                    row.get("Relationship_Type") or row.get("Relationship") or "driver"
+                )
+                weight = row.get("Driver_Weight") or row.get("Weight") or "Unweighted"
+                details.append(f"- {child}: {relationship}, {weight}")
+
+        if not playbook.empty:
+            details.extend(["", "Investigation playbook scenarios:"])
+            for _, row in playbook.head(3).iterrows():
+                scenario = row.get("Scenario", "Scenario")
+                threshold = row.get("Threshold", "No threshold")
+                severity = row.get("Severity", "No severity")
+                action = row.get("Recommended_Action") or row.get("Action") or ""
+                line = f"- {scenario}: {threshold}, {severity}"
+                if action:
+                    line += f". Action: {action}"
+                details.append(line)
+
+        details.extend(["", f"Knowledge source: {source_summary}"])
+        return "\n".join(details)
+
+    def _kpi_knowledge_source_summary(self, metric: str) -> str:
+        if self.knowledge_store is None:
+            return "loaded Excel knowledge base"
+
+        results = self.knowledge_store.search_kpi(metric, metric, limit=5)
+        if not results:
+            return "loaded Excel knowledge base"
+
+        source_labels = []
+        for result in results:
+            metadata = result.get("metadata", {})
+            sheet = str(metadata.get("sheet", "")).strip()
+            if not sheet:
+                continue
+            label = self._readable_knowledge_sheet_name(sheet)
+            if label not in source_labels:
+                source_labels.append(label)
+
+        if not source_labels:
+            return "loaded Excel knowledge base"
+        return f"{metric} records from " + ", ".join(source_labels)
+
+    @staticmethod
+    def _readable_knowledge_sheet_name(sheet_name: str) -> str:
+        normalized = sheet_name.lower()
+        if "knowledge_map" in normalized:
+            return "KPI knowledge map"
+        if "relationship_map" in normalized:
+            return "relationship map"
+        if "formula_definition" in normalized:
+            return "formula definition"
+        if "investigation_playbook" in normalized:
+            return "investigation playbook"
+        if sheet_name == "kpi_catalog":
+            return "KPI catalog"
+        return sheet_name
 
     def _format_root_cause(self, metric: str, bu: str | None = None) -> str:
         analysis = self.analytics.root_cause_analysis(metric, bu=bu)
@@ -753,6 +904,39 @@ Doctor: {doctor_name}
 - Avg No-Show: {df_doctor["No-Show %"].mean() * 100:.1f}%
 - Avg Retention: {df_doctor["Patient Retention %"].mean() * 100:.1f}%
 """.strip()
+
+    def _search_kpi_knowledge(self, query: str, metric: str | None = None) -> str:
+        if self.knowledge_store is None:
+            return (
+                "The Chroma knowledge store is not available. The agent can still "
+                "use the loaded Excel knowledge base through its analytics tools."
+            )
+
+        if metric:
+            results = self.knowledge_store.search_kpi(metric, query, limit=5)
+        else:
+            results = self.knowledge_store.search(query, limit=5)
+        if not results:
+            return f"No Chroma knowledge-base results found for: {query}"
+
+        lines = [f"Chroma knowledge-base results for: {query}"]
+        for index, result in enumerate(results, start=1):
+            metadata = result.get("metadata", {})
+            source = metadata.get("source", "knowledge_base")
+            sheet = metadata.get("sheet", "")
+            kpi = metadata.get("kpi", "")
+            document = self._compact_text(result.get("document", ""), max_length=650)
+
+            heading_parts = [f"{index}. {source}"]
+            if kpi:
+                heading_parts.append(str(kpi))
+            if sheet:
+                heading_parts.append(f"sheet={sheet}")
+
+            lines.append(" | ".join(heading_parts))
+            lines.append(document)
+
+        return "\n".join(lines)
 
     def _format_doctor_kpi_profile(
         self,
@@ -1258,6 +1442,13 @@ Doctor: {doctor_name}
                     parts.append(str(item))
             return "\n".join(parts)
         return str(content)
+
+    @staticmethod
+    def _compact_text(value: str, max_length: int = 500) -> str:
+        text = re.sub(r"\s+", " ", str(value)).strip()
+        if len(text) <= max_length:
+            return text
+        return text[: max_length - 3].rstrip() + "..."
 
     def _fallback_response(self) -> str:
         return f"""

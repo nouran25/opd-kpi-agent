@@ -31,7 +31,9 @@ class Config:
 
     # Database paths
     db_path: Path = PROJECT_ROOT / "data" / "opd_analytics.db"
-    vector_store_path: Path = PROJECT_ROOT / "data" / "chroma_db"
+    vector_store_path: Path = Path(
+        os.getenv("VECTOR_STORE_PATH", PROJECT_ROOT / "data" / "chroma_DB")
+    )
 
     # Analysis thresholds
     revenue_leakage_threshold: float = 0.10
