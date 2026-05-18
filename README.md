@@ -1,3 +1,15 @@
+---
+title: OPD KPI Intelligence Agent
+emoji: 📊
+colorFrom: green
+colorTo: blue
+sdk: gradio
+sdk_version: "6.14.0"
+python_version: "3.11"
+app_file: app.py
+pinned: false
+---
+
 # OPD KPI Intelligence Agent
 
 An interactive Gradio application for analyzing Outpatient Department (OPD) KPI performance across doctors, business units, time periods, and operational drivers.
@@ -7,7 +19,7 @@ The app combines a structured analytics engine, a local Chroma knowledge store, 
 ## Features
 
 - Modern Gradio chat interface with KPI filters and prompt cards
-- Doctor performance summaries and KPI justifications
+- Doctor-BU performance summaries and KPI justifications, so `Ola (ASH)`, `Ola (HJH)`, and `Ola (SMH)` are treated as separate profiles
 - BU-level comparison across ASH, SMH, and HJH
 - Root cause analysis using the knowledge-base relationship map
 - Chroma-backed KPI knowledge lookup for definitions, formulas, owners, playbooks, and relationships
@@ -20,6 +32,7 @@ The app combines a structured analytics engine, a local Chroma knowledge store, 
 
 ```text
 Show me Doctor Ahmed's performance, and give me justifications for his KPIs
+Justify Dr. Ola's PMS performance in HJH
 What are the root causes of high service leakage in HJH?
 What is causing high service leakage in HJH, and what investigation steps should the PA Supervisor follow?
 Search the KPI knowledge base for Service Leakage %. Tell me the KPI owner, business question, financial impact formula, primary and secondary drivers, and investigation steps.
@@ -40,7 +53,6 @@ OPD Agent/
 +-- data/
 |   +-- OPD dataset.xlsx
 |   +-- Knowledge base.xlsx
-|   +-- chroma_DB/
 +-- src/
     +-- config.py
     +-- agents/
@@ -179,7 +191,6 @@ The app expects these files:
 ```text
 data/OPD dataset.xlsx
 data/Knowledge base.xlsx
-data/chroma_DB/
 ```
 
 The OPD dataset should include the main KPI table. The current loader expects a sheet named:
@@ -190,7 +201,14 @@ OPD_KPI_Dataset
 
 The knowledge base can include KPI definitions, relationship maps, and investigation playbooks. The agent uses it to resolve KPI meaning and explain root causes.
 
-The Chroma database is created automatically at `data/chroma_DB` when the agent starts. It persists indexed knowledge-base records so later runs can search the KPI knowledge base quickly.
+The Chroma database is created automatically at `data/chroma_DB` when the agent starts. Do not upload this generated folder to Hugging Face Spaces or Git. It contains local SQLite/index files and can be rebuilt from `data/Knowledge base.xlsx`.
+
+For Hugging Face Spaces, upload the source code, `requirements.txt`, `README.md`, and the Excel files required by the app. Leave out:
+
+```text
+data/chroma_DB/
+data/chroma_db/
+```
 
 ## Setup
 

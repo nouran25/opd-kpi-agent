@@ -79,9 +79,12 @@ class OPDKpiAgent:
         """Create the LangChain agent and expose safe analytical tools."""
 
         @tool
-        def get_doctor_performance(doctor_name: str) -> str:
-            """Get performance summary for a specific doctor."""
-            return self._format_doctor_performance(doctor_name)
+        def get_doctor_performance(doctor_name: str, bu_name: str = "") -> str:
+            """Get performance summary for a doctor. If bu_name is omitted and the doctor works in multiple BUs, return each doctor-BU profile separately."""
+            bu = self._resolve_optional_bu(bu_name)
+            if bu_name and bu is None:
+                return self._unknown_bu_message(bu_name)
+            return self._format_doctor_performance(doctor_name, bu=bu)
 
         @tool
         def analyze_root_cause(kpi_name: str, bu_name: str = "") -> str:
@@ -189,7 +192,7 @@ class OPDKpiAgent:
     def _system_prompt(self) -> str:
         kpis = ", ".join(self._available_kpi_columns()[:30])
         bus = ", ".join(self.data.get_bu_list())
-        doctors = ", ".join(self.data.get_doctor_list()[:20])
+        doctors = ", ".join(self.data.get_doctor_display_list()[:20])
         return (
             "You are a professional OPD KPI Analytics Agent for healthcare "
             "operations.\n\n"
@@ -200,27 +203,28 @@ class OPDKpiAgent:
             "workbook and dataset columns.\n"
             "3. If the user asks to compare BUs such as ASH vs SMH, call compare_business_units, not compare_doctors.\n"
             "4. If the user mentions a BU, year, or month, pass it to the tool.\n"
-            "5. For root-cause questions, call analyze_root_cause.\n"
-            "6. Do not assume a BU when the user does not provide one; leave bu_name empty so the tool uses all BUs.\n"
-            "7. Use search_kpi_knowledge when the user asks about KPI definitions, "
+            "5. Treat the same doctor name in different BUs as different doctor identities. If a doctor name is repeated across BUs and the user does not specify the BU, answer for each available doctor-BU profile separately.\n"
+            "6. For root-cause questions, call analyze_root_cause.\n"
+            "7. Do not assume a BU when the user does not provide one; leave bu_name empty so the tool uses all BUs.\n"
+            "8. Use search_kpi_knowledge when the user asks about KPI definitions, "
             "formulas, playbooks, relationships, recommended actions, or a KPI "
             "whose wording does not resolve cleanly to a dataset column.\n"
-            "8. Explain what the numbers mean operationally. Include drivers, "
+            "9. Explain what the numbers mean operationally. Include drivers, "
             "risks, and next actions.\n"
-            "9. Keep answers concise but thorough: executive summary, evidence, "
+            "10. Keep answers concise but thorough: executive summary, evidence, "
             "interpretation, and recommendations.\n"
-            "10. Stay within the 1024-token response limit and finish cleanly. Target "
+            "11. Stay within the 1024-token response limit and finish cleanly. Target "
             "350-500 words, or 250-400 words when using a table.\n"
-            "11. Use tables when they improve clarity, especially for month-by-month "
+            "12. Use tables when they improve clarity, especially for month-by-month "
             "trends, BU comparisons, doctor comparisons, or driver snapshots. Avoid "
             "tables for simple narrative explanations.\n"
-            "12. Keep tables compact: use at most one table unless the user explicitly "
+            "13. Keep tables compact: use at most one table unless the user explicitly "
             "asks for detailed tables, include only the most useful columns, and avoid "
             "wide tables with long text inside cells.\n"
-            "13. Format recommendations as a numbered action list with short bullets "
+            "14. Format recommendations as a numbered action list with short bullets "
             "under each action when useful. Prefer 3 practical recommendations; use "
             "5 only when no table is included or the user asks for depth.\n"
-            "14. If space is limited, prioritize the conclusion, the most important "
+            "15. If space is limited, prioritize the conclusion, the most important "
             "evidence, and actionable recommendations over extra explanation.\n\n"
             f"Available BUs: {bus}.\n"
             f"Available doctors include: {doctors}.\n"
@@ -309,6 +313,17 @@ class OPDKpiAgent:
             return self._format_kpi_knowledge_lookup(metric, user_input)
 
         if doctor and asks_for_justification:
+            if not bu and self._doctor_has_multiple_bus(doctor):
+                if metric:
+                    return self._format_all_doctor_bu_kpi_justifications(
+                        doctor,
+                        metric,
+                    )
+                return self._format_all_doctor_bu_profiles(
+                    doctor,
+                    year=year,
+                    month=month,
+                )
             if metric:
                 return self._format_doctor_kpi_justification(doctor, metric, bu=bu)
             return self._format_doctor_kpi_profile(
@@ -484,16 +499,10 @@ Recommended actions:
         metric: str,
         bu: str | None = None,
     ) -> str:
-        df = self.data.df[
-            self.data.df["Doctor Name"].str.contains(
-                doctor_name,
-                case=False,
-                na=False,
-                regex=False,
-            )
-        ].copy()
-        if bu:
-            df = df[df["BU"] == bu]
+        if not bu and self._doctor_has_multiple_bus(doctor_name):
+            return self._format_all_doctor_bu_kpi_justifications(doctor_name, metric)
+
+        df = self._doctor_scoped_df(doctor_name, bu=bu).copy()
         if df.empty:
             scope = f" in {bu}" if bu else ""
             return f"No data found for Dr. {doctor_name}{scope}."
@@ -519,14 +528,7 @@ Recommended actions:
             peer_df = peer_df[peer_df["BU"] == bu]
         peer_current = peer_df[
             (peer_df["Date"] == latest_date)
-            & ~(
-                peer_df["Doctor Name"].str.contains(
-                    doctor_name,
-                    case=False,
-                    na=False,
-                    regex=False,
-                )
-            )
+            & ~self._doctor_name_mask(peer_df, doctor_name)
         ]
         if peer_current.empty:
             peer_current = current
@@ -570,6 +572,7 @@ Recommended actions:
 
         metadata = self.data.get_kpi_metadata(metric)
         scope = f" in {bu}" if bu else ""
+        doctor_label = self._doctor_identity_label(doctor_name, bu)
         peer_gap = current_value - peer_value
         peer_gap_text = (
             f"{self._format_metric_value(metric, abs(peer_gap))} above peer average"
@@ -595,10 +598,10 @@ Recommended actions:
         )
 
         return f"""
-Justification: Dr. {doctor_name}'s {metric} performance{scope}
+Justification: Dr. {doctor_label}'s {metric} performance{scope}
 
 Executive readout:
-Dr. {doctor_name}'s current {metric} is {self._format_metric_value(metric, current_value)}, changing {change_pct:+.1f}% versus the previous period. Against the selected peer group, this is {peer_gap_text}. Revenue achievement is {achievement:.1f}%, so the KPI should be interpreted alongside volume, retention, no-show, and leakage behavior rather than in isolation.
+Dr. {doctor_label}'s current {metric} is {self._format_metric_value(metric, current_value)}, changing {change_pct:+.1f}% versus the previous period. Against the selected peer group, this is {peer_gap_text}. Revenue achievement is {achievement:.1f}%, so the KPI should be interpreted alongside volume, retention, no-show, and leakage behavior rather than in isolation.
 
 Evidence:
 - Current period: {self._format_metric_value(metric, current_value)}
@@ -719,10 +722,11 @@ Recommended actions:
             return f"No data for metric: {metric}"
 
         aggregate = "sum" if self._is_additive_metric(metric) else "mean"
+        group_columns = ["Doctor Name"] if bu else ["BU", "Doctor Name"]
         if aggregate == "sum":
-            ranking = df.groupby("Doctor Name")[metric].sum().reset_index()
+            ranking = df.groupby(group_columns)[metric].sum().reset_index()
         else:
-            ranking = df.groupby("Doctor Name")[metric].mean().reset_index()
+            ranking = df.groupby(group_columns)[metric].mean().reset_index()
         ranking = (
             ranking.sort_values(metric, ascending=False).head(5).reset_index(drop=True)
         )
@@ -734,8 +738,9 @@ Recommended actions:
         scope = self._scope_text(bu=bu, year=year, month=month)
         lines = [f"Top doctors by {metric}{scope}:"]
         for _, row in ranking.iterrows():
+            doctor_label = self._doctor_identity_label(row["Doctor Name"], row.get("BU"))
             lines.append(
-                f"{row['rank']}. {row['Doctor Name']}: "
+                f"{row['rank']}. {doctor_label}: "
                 f"{self._format_metric_value(metric, row[metric])}"
             )
         return "\n".join(lines)
@@ -809,10 +814,11 @@ Recommended actions:
         if ("%" in metric or "cr%" in metric.lower()) and threshold > 1:
             threshold = threshold / 100
 
+        group_columns = ["Doctor Name"] if bu else ["BU", "Doctor Name"]
         if self._is_additive_metric(metric):
-            grouped = df.groupby("Doctor Name")[metric].sum().reset_index()
+            grouped = df.groupby(group_columns)[metric].sum().reset_index()
         else:
-            grouped = df.groupby("Doctor Name")[metric].mean().reset_index()
+            grouped = df.groupby(group_columns)[metric].mean().reset_index()
 
         if operator == "above":
             result = grouped[grouped[metric] > threshold].sort_values(
@@ -840,8 +846,9 @@ Recommended actions:
             "Doctor list:",
         ]
         for index, (_, row) in enumerate(result.iterrows(), start=1):
+            doctor_label = self._doctor_identity_label(row["Doctor Name"], row.get("BU"))
             lines.append(
-                f"{index}. {row['Doctor Name']}: "
+                f"{index}. {doctor_label}: "
                 f"{self._format_metric_value(metric, row[metric])}"
             )
 
@@ -876,27 +883,28 @@ BU Summary: {bu}
 - Avg Service Leakage: {df_bu["Service Leakage %"].mean() * 100:.1f}%
 """.strip()
 
-    def _format_doctor_performance(self, doctor_name: str) -> str:
-        df_doctor = self.data.df[
-            self.data.df["Doctor Name"].str.contains(
-                doctor_name,
-                case=False,
-                na=False,
-                regex=False,
-            )
-        ]
+    def _format_doctor_performance(
+        self,
+        doctor_name: str,
+        bu: str | None = None,
+    ) -> str:
+        if not bu and self._doctor_has_multiple_bus(doctor_name):
+            return self._format_all_doctor_bu_performance(doctor_name)
+
+        df_doctor = self._doctor_scoped_df(doctor_name, bu=bu)
         if df_doctor.empty:
             return (
                 f"Doctor '{doctor_name}' not found. Available doctors: "
-                f"{', '.join(self.data.get_doctor_list()[:10])}"
+                f"{', '.join(self.data.get_doctor_display_list()[:10])}"
             )
 
         total_revenue = float(df_doctor["Total Revenue"].sum())
         target_revenue = float(df_doctor["Target Revenue"].sum())
         achievement = (total_revenue / target_revenue * 100) if target_revenue else 0
+        doctor_label = self._doctor_identity_label(doctor_name, bu)
 
         return f"""
-Doctor: {doctor_name}
+Doctor: {doctor_label}
 - Total Revenue: ${total_revenue:,.0f}
 - Target Revenue: ${target_revenue:,.0f}
 - Achievement: {achievement:.1f}%
@@ -904,6 +912,147 @@ Doctor: {doctor_name}
 - Avg No-Show: {df_doctor["No-Show %"].mean() * 100:.1f}%
 - Avg Retention: {df_doctor["Patient Retention %"].mean() * 100:.1f}%
 """.strip()
+
+    def _format_all_doctor_bu_performance(self, doctor_name: str) -> str:
+        bus = self.data.get_bus_for_doctor(doctor_name)
+        if not bus:
+            return (
+                f"Doctor '{doctor_name}' not found. Available doctors: "
+                f"{', '.join(self.data.get_doctor_display_list()[:10])}"
+            )
+
+        sections = [
+            f"Doctor performance for all available Dr. {doctor_name} profiles:",
+            "",
+        ]
+        for bu in bus:
+            df_doctor = self._doctor_scoped_df(doctor_name, bu=bu)
+            total_revenue = float(df_doctor["Total Revenue"].sum())
+            target_revenue = float(df_doctor["Target Revenue"].sum())
+            achievement = (
+                total_revenue / target_revenue * 100 if target_revenue else 0
+            )
+            sections.extend(
+                [
+                    f"Dr. {self._doctor_identity_label(doctor_name, bu)}",
+                    f"- Total Revenue: ${total_revenue:,.0f}",
+                    f"- Target Revenue: ${target_revenue:,.0f}",
+                    f"- Achievement: {achievement:.1f}%",
+                    f"- Cases: {df_doctor['No. Cases'].sum():,.0f}",
+                    f"- Avg No-Show: {df_doctor['No-Show %'].mean() * 100:.1f}%",
+                    f"- Avg Retention: {df_doctor['Patient Retention %'].mean() * 100:.1f}%",
+                    "",
+                ]
+            )
+        return "\n".join(sections).strip()
+
+    def _format_all_doctor_bu_kpi_justifications(
+        self,
+        doctor_name: str,
+        metric: str,
+    ) -> str:
+        bus = self.data.get_bus_for_doctor(doctor_name)
+        if not bus:
+            return (
+                f"Doctor '{doctor_name}' not found. Available doctors: "
+                f"{', '.join(self.data.get_doctor_display_list()[:10])}"
+            )
+
+        sections = [
+            f"{metric} justification for all available Dr. {doctor_name} profiles:",
+            "",
+        ]
+        for bu in bus:
+            sections.append(self._format_doctor_kpi_justification(doctor_name, metric, bu=bu))
+            sections.append("")
+        return "\n\n".join(section for section in sections if section).strip()
+
+    def _format_all_doctor_bu_profiles(
+        self,
+        doctor_name: str,
+        year: int | None = None,
+        month: int | None = None,
+    ) -> str:
+        bus = self.data.get_bus_for_doctor(doctor_name)
+        if not bus:
+            return (
+                f"Doctor '{doctor_name}' not found. Available doctors: "
+                f"{', '.join(self.data.get_doctor_display_list()[:10])}"
+            )
+
+        sections = [
+            f"KPI profile for all available Dr. {doctor_name} profiles:",
+            "",
+        ]
+        for bu in bus:
+            sections.append(
+                self._format_compact_doctor_kpi_profile(
+                    doctor_name,
+                    bu=bu,
+                    year=year,
+                    month=month,
+                )
+            )
+            sections.append("")
+        return "\n\n".join(section for section in sections if section).strip()
+
+    def _format_compact_doctor_kpi_profile(
+        self,
+        doctor_name: str,
+        bu: str,
+        year: int | None = None,
+        month: int | None = None,
+    ) -> str:
+        df = self._scoped_df(bu=bu, year=year, month=month)
+        df_doctor = self._doctor_filter(df, doctor_name).copy()
+        if df_doctor.empty:
+            return f"No data found for Dr. {self._doctor_identity_label(doctor_name, bu)}."
+
+        total_revenue = float(df_doctor["Total Revenue"].sum())
+        target_revenue = float(df_doctor["Target Revenue"].sum())
+        revenue_achievement = total_revenue / target_revenue if target_revenue else 0
+        total_cases = float(df_doctor["No. Cases"].sum())
+        target_cases = float(df_doctor["Target No. cases"].sum())
+        cases_achievement = total_cases / target_cases if target_cases else 0
+
+        kpi_candidates = [
+            "Revenue_Achievement_%",
+            "Cases_Achievement_%",
+            "Doctor PMS %",
+            "No-Show %",
+            "Patient Retention %",
+            "Service Leakage %",
+        ]
+        peer_df = df[~df.index.isin(df_doctor.index)]
+        if peer_df.empty:
+            peer_df = df
+
+        lines = [
+            f"Dr. {self._doctor_identity_label(doctor_name, bu)}",
+            (
+                f"- Revenue: ${total_revenue:,.0f} / ${target_revenue:,.0f} "
+                f"({revenue_achievement * 100:.1f}% achievement)"
+            ),
+            (
+                f"- Cases: {total_cases:,.0f} / {target_cases:,.0f} "
+                f"({cases_achievement * 100:.1f}% achievement)"
+            ),
+            "- KPI evidence:",
+        ]
+
+        for metric in [item for item in kpi_candidates if item in df_doctor.columns]:
+            doctor_value = self.analytics._aggregate_metric(df_doctor, metric)
+            peer_value = self._peer_doctor_metric_average(peer_df, metric)
+            gap = doctor_value - peer_value
+            gap_pct = (gap / peer_value * 100) if peer_value else 0
+            direction = self._doctor_gap_direction(metric, gap)
+            lines.append(
+                f"  - {metric}: {self._format_metric_value(metric, doctor_value)} "
+                f"vs BU peer {self._format_metric_value(metric, peer_value)} "
+                f"({gap_pct:+.1f}% gap, {direction})"
+            )
+
+        return "\n".join(lines)
 
     def _search_kpi_knowledge(self, query: str, metric: str | None = None) -> str:
         if self.knowledge_store is None:
@@ -945,20 +1094,20 @@ Doctor: {doctor_name}
         year: int | None = None,
         month: int | None = None,
     ) -> str:
-        df = self._scoped_df(bu=bu, year=year, month=month)
-        df_doctor = df[
-            df["Doctor Name"].str.contains(
+        if not bu and self._doctor_has_multiple_bus(doctor_name):
+            return self._format_all_doctor_bu_profiles(
                 doctor_name,
-                case=False,
-                na=False,
-                regex=False,
+                year=year,
+                month=month,
             )
-        ].copy()
+
+        df = self._scoped_df(bu=bu, year=year, month=month)
+        df_doctor = self._doctor_filter(df, doctor_name).copy()
         if df_doctor.empty:
             scope = self._scope_text(bu=bu, year=year, month=month)
             return (
                 f"Doctor '{doctor_name}' not found{scope}. Available doctors: "
-                f"{', '.join(self.data.get_doctor_list()[:10])}"
+                f"{', '.join(self.data.get_doctor_display_list()[:10])}"
             )
 
         total_revenue = float(df_doctor["Total Revenue"].sum())
@@ -985,12 +1134,13 @@ Doctor: {doctor_name}
         kpis = [metric for metric in kpi_candidates if metric in df_doctor.columns]
 
         scope = self._scope_text(bu=bu, year=year, month=month)
+        doctor_label = self._doctor_identity_label(doctor_name, bu)
         lines = [
-            f"Doctor KPI Performance and Justification: Dr. {doctor_name}{scope}",
+            f"Doctor KPI Performance and Justification: Dr. {doctor_label}{scope}",
             "",
             "Executive readout:",
             (
-                f"Dr. {doctor_name} generated ${total_revenue:,.0f} against a "
+                f"Dr. {doctor_label} generated ${total_revenue:,.0f} against a "
                 f"${target_revenue:,.0f} target ({revenue_achievement * 100:.1f}% achievement) "
                 f"across {total_cases:,.0f} cases ({cases_achievement * 100:.1f}% of case target). "
                 "The KPI justification below compares the doctor's performance with the selected peer group "
@@ -1126,10 +1276,15 @@ Doctor: {doctor_name}
         if peer_df.empty or metric not in peer_df.columns:
             return 0
 
+        group_columns = (
+            ["BU", "Doctor Name"]
+            if "BU" in peer_df.columns
+            else ["Doctor Name"]
+        )
         if self._is_additive_metric(metric):
-            per_doctor = peer_df.groupby("Doctor Name")[metric].sum()
+            per_doctor = peer_df.groupby(group_columns)[metric].sum()
         else:
-            per_doctor = peer_df.groupby("Doctor Name")[metric].mean()
+            per_doctor = peer_df.groupby(group_columns)[metric].mean()
         return float(per_doctor.mean()) if not per_doctor.empty else 0
 
     def _kpi_driver_summary(self, metric: str) -> str:
@@ -1394,6 +1549,31 @@ Doctor: {doctor_name}
             if str(doctor).lower() in lowered:
                 return doctor
         return None
+
+    def _doctor_name_mask(self, df, doctor_name: str):
+        normalized = self.data.normalize_lookup_text(doctor_name)
+        return (
+            df["Doctor Name"].astype(str).map(self.data.normalize_lookup_text)
+            == normalized
+        )
+
+    def _doctor_filter(self, df, doctor_name: str):
+        if "Doctor Name" not in df.columns:
+            return df.iloc[0:0]
+        return df[self._doctor_name_mask(df, doctor_name)]
+
+    def _doctor_scoped_df(self, doctor_name: str, bu: str | None = None):
+        df = self.data.df.copy()
+        if bu:
+            df = df[df["BU"] == bu]
+        return self._doctor_filter(df, doctor_name)
+
+    def _doctor_has_multiple_bus(self, doctor_name: str) -> bool:
+        return len(self.data.get_bus_for_doctor(doctor_name)) > 1
+
+    @staticmethod
+    def _doctor_identity_label(doctor_name: str, bu: str | None = None) -> str:
+        return f"{doctor_name} ({bu})" if bu else str(doctor_name)
 
     def _unknown_metric_message(self, metric_name: str) -> str:
         return (

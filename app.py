@@ -11,6 +11,22 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+
+def _suppress_known_asyncio_cleanup_noise(unraisable):
+    """Hide a harmless asyncio destructor message seen in hosted Spaces logs."""
+    exc = unraisable.exc_value
+    obj = str(unraisable.object)
+    if (
+        isinstance(exc, ValueError)
+        and "Invalid file descriptor" in str(exc)
+        and "BaseEventLoop.__del__" in obj
+    ):
+        return
+    sys.__unraisablehook__(unraisable)
+
+
+sys.unraisablehook = _suppress_known_asyncio_cleanup_noise
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.agents.kpi_agent import OPDKpiAgent
@@ -19,7 +35,7 @@ from src.config import config
 
 WELCOME_MESSAGE = """Welcome to the OPD KPI Intelligence Agent.
 
-I have access to the OPD dataset for 2023-2025 across ASH, SMH, and HJH business units, covering 11 doctors and 24 KPIs.
+I have access to the OPD dataset for 2023-2025 across ASH, SMH, and HJH business units, covering 33 doctor-BU profiles and 24 KPIs.
 
 You can ask me anything, for example:
 
@@ -301,7 +317,7 @@ def create_web_interface(agent: OPDKpiAgent):
         agent.chat_history = []
         return "", WELCOME_HISTORY.copy()
 
-    doctor_choices = ["All doctors"] + agent.data.get_doctor_list()
+    doctor_choices = ["All doctors"] + agent.data.get_doctor_display_list()
     bu_choices = ["All BUs"] + agent.data.get_bu_list()
     year_choices = ["All years"] + [
         str(year)
@@ -323,7 +339,7 @@ def create_web_interface(agent: OPDKpiAgent):
                   <div class="opd-badges">
                     <span class="opd-badge">2023-2025 Dataset</span>
                     <span class="opd-badge">ASH / SMH / HJH</span>
-                    <span class="opd-badge">11 Doctors</span>
+                    <span class="opd-badge">33 Doctor-BU profiles</span>
                     <span class="opd-badge">24 KPIs</span>
                     <span class="opd-badge">Knowledge-base driven</span>
                   </div>

@@ -218,6 +218,36 @@ class OPDDataLoader:
             return []
         return self.df["Doctor Name"].dropna().unique().tolist()
 
+    def get_doctor_bu_pairs(self):
+        """Get unique doctor and BU combinations."""
+        if not {"Doctor Name", "BU"}.issubset(self.df.columns):
+            return []
+        pairs = (
+            self.df[["Doctor Name", "BU"]]
+            .dropna()
+            .drop_duplicates()
+            .sort_values(["Doctor Name", "BU"])
+        )
+        return list(pairs.itertuples(index=False, name=None))
+
+    def get_doctor_display_list(self):
+        """Get display labels that treat the same doctor name in each BU separately."""
+        return [
+            f"{doctor} ({bu})"
+            for doctor, bu in self.get_doctor_bu_pairs()
+        ]
+
+    def get_bus_for_doctor(self, doctor_name: str):
+        """Get BUs where a doctor name appears."""
+        if not {"Doctor Name", "BU"}.issubset(self.df.columns):
+            return []
+        normalized = self.normalize_lookup_text(doctor_name)
+        matches = self.df[
+            self.df["Doctor Name"].astype(str).map(self.normalize_lookup_text)
+            == normalized
+        ]
+        return sorted(matches["BU"].dropna().unique().tolist())
+
     def get_bu_list(self):
         """Get unique business unit names."""
         if "BU" not in self.df.columns:
