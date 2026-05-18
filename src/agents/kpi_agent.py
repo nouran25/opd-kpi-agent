@@ -183,7 +183,20 @@ class OPDKpiAgent:
             "7. Explain what the numbers mean operationally. Include drivers, "
             "risks, and next actions.\n"
             "8. Keep answers concise but thorough: executive summary, evidence, "
-            "interpretation, and recommendations.\n\n"
+            "interpretation, and recommendations.\n"
+            "9. Stay within the 1024-token response limit and finish cleanly. Target "
+            "350-500 words, or 250-400 words when using a table.\n"
+            "10. Use tables when they improve clarity, especially for month-by-month "
+            "trends, BU comparisons, doctor comparisons, or driver snapshots. Avoid "
+            "tables for simple narrative explanations.\n"
+            "11. Keep tables compact: use at most one table unless the user explicitly "
+            "asks for detailed tables, include only the most useful columns, and avoid "
+            "wide tables with long text inside cells.\n"
+            "12. Format recommendations as a numbered action list with short bullets "
+            "under each action when useful. Prefer 3 practical recommendations; use "
+            "5 only when no table is included or the user asks for depth.\n"
+            "13. If space is limited, prioritize the conclusion, the most important "
+            "evidence, and actionable recommendations over extra explanation.\n\n"
             f"Available BUs: {bus}.\n"
             f"Available doctors include: {doctors}.\n"
             f"Available KPI columns include: {kpis}."
@@ -233,6 +246,7 @@ class OPDKpiAgent:
             term in normalized
             for term in ["justify", "justification", "explain", "why", "performance"]
         )
+
         if doctor and asks_for_justification:
             if metric:
                 return self._format_doctor_kpi_justification(doctor, metric, bu=bu)
