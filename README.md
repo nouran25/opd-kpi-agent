@@ -81,10 +81,10 @@ Responsibilities:
 
 Important behavior:
 
-- The agent does not rely on one-off hard-coded answers.
+- The agent avoids one-off hard-coded answers and relies on the loaded dataset, analytics engine, and knowledge base.
 - It resolves KPI names using dataset columns and the knowledge base.
-- It answers common analytical questions directly for speed.
-- It falls back to the LLM only when needed.
+- It answers some common structured questions directly for speed, especially doctor KPI justification/profile requests.
+- For broader or less structured questions, it uses the LLM with analytical tools when available.
 
 ### `src/data/loader.py`
 
