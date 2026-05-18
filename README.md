@@ -12,34 +12,42 @@ pinned: false
 
 # OPD KPI Intelligence Agent
 
-An interactive Gradio application for analyzing Outpatient Department (OPD) KPI performance across doctors, business units, time periods, and operational drivers.
+An interactive Gradio app for analyzing Outpatient Department (OPD) KPI performance across business units, doctor-BU profiles, time periods, and operational drivers.
 
-The app combines a structured analytics engine, a local Chroma knowledge store, and a Groq-powered LangChain agent. Fast, high-confidence KPI questions are answered directly from the dataset and knowledge base, while broader natural-language questions can use the hosted LLM and the available analytical tools.
+The app uses a hybrid analytics architecture:
 
-## Features
+- **Dataframe analytics** for exact KPI numbers, trends, comparisons, thresholds, and root-cause calculations.
+- **ChromaDB RAG** for KPI knowledge-base retrieval: definitions, formulas, owners, drivers, investigation steps, playbooks, and recommended actions.
+- **Groq + LangChain** for broader natural-language reasoning when a request does not map cleanly to a deterministic route.
 
-- Modern Gradio chat interface with KPI filters and prompt cards
-- Doctor-BU performance summaries and KPI justifications, so `Ola (ASH)`, `Ola (HJH)`, and `Ola (SMH)` are treated as separate profiles
-- BU-level comparison across ASH, SMH, and HJH
-- Root cause analysis using the knowledge-base relationship map
-- Chroma-backed KPI knowledge lookup for definitions, formulas, owners, playbooks, and relationships
+The model should not guess KPI facts from memory. Numeric answers are grounded in `data/OPD dataset.xlsx`, and knowledge answers are grounded in `data/Knowledge base.xlsx` through Chroma retrieval.
+
+## Key Features
+
+- Modern Gradio chat interface with BU, doctor, year, and KPI filters
+- Doctor-BU profile handling: `Ahmed (ASH)`, `Ahmed (HJH)`, and `Ahmed (SMH)` are treated as separate profiles
+- If a doctor name is provided without a BU, the app answers for all available doctor-BU profiles for that doctor
+- BU comparison across ASH, SMH, and HJH
+- Root-cause analysis using the KPI relationship map
+- Chroma-backed RAG lookup for KPI definitions, formulas, owners, playbooks, and relationships
 - KPI trend analysis over time
 - Threshold questions such as doctors above a no-show rate
 - Natural-language KPI resolution, for example `service leakage`, `PMS`, or `patient retention`
-- Groq-hosted LLM support for faster agentic reasoning without running a model locally
+- Guardrails for unknown KPIs: the app does not invent definitions or formulas for KPIs that are not in the loaded dataset or knowledge base
 
 ## Example Questions
 
 ```text
 Show me Doctor Ahmed's performance, and give me justifications for his KPIs
+Show me Doctor Ahmed's performance in HJH, and give me justifications for his KPIs
 Justify Dr. Ola's PMS performance in HJH
 What are the root causes of high service leakage in HJH?
 What is causing high service leakage in HJH, and what investigation steps should the PA Supervisor follow?
 Search the KPI knowledge base for Service Leakage %. Tell me the KPI owner, business question, financial impact formula, primary and secondary drivers, and investigation steps.
-Compare patient retention across all BUs in 2023
+Compare patient retention across ASH, SMH, and HJH in 2023
 Which doctors have a no-show rate above 20%?
-Justify Dr. Mahmoud's PMS performance in ASH
-Show the trend for service leakage in HJH
+Show the monthly trend for Service Leakage % in HJH for 2025
+What is the definition and calculation formula for the KPI Patient Retention %?
 ```
 
 ## Project Structure
@@ -64,153 +72,130 @@ OPD Agent/
         +-- vector_store.py
 ```
 
-## Code Overview
-
-### `app.py`
-
-Main Gradio application entry point.
-
-Responsibilities:
-
-- Builds the web interface
-- Displays the welcome message, dataset badges, prompt cards, and chat panel
-- Adds optional filters for BU, doctor, year, and KPI
-- Sends user questions to the KPI agent
-- Launches the local Gradio server
-
-Run this file to start the app:
-
-```powershell
-python app.py
-```
-
-### `src/agents/kpi_agent.py`
-
-Main intelligence layer for the application.
-
-Responsibilities:
-
-- Initializes the data loader, analytics engine, Groq model, and LangChain agent
-- Routes simple structured questions to fast dataframe-based answers
-- Initializes the Chroma-backed KPI knowledge store
-- Uses LangChain tools for more open-ended agent responses
-- Formats professional responses with executive readouts, evidence, drivers, and recommendations
-- Resolves doctors, BUs, years, KPIs, and threshold filters from natural-language questions
-
-Important behavior:
-
-- The agent avoids one-off hard-coded answers and relies on the loaded dataset, analytics engine, and knowledge base.
-- It resolves KPI names using dataset columns and the knowledge base.
-- It answers common structured questions directly for speed, including doctor KPI justification/profile requests, root-cause questions, and KPI knowledge-base lookups.
-- For broader or less structured questions, it uses the LLM with analytical tools when available.
-
-### `src/data/loader.py`
-
-Data ingestion and KPI metadata layer.
-
-Responsibilities:
-
-- Loads `data/OPD dataset.xlsx`
-- Loads all sheets from `data/Knowledge base.xlsx`
-- Prepares date columns such as `Date`, `Year`, `Month_Num`, and `YearMonth`
-- Creates derived metrics:
-  - `Revenue_Achievement_%`
-  - `Cases_Achievement_%`
-  - `Revenue_per_Case`
-  - `Leakage_Impact_%`
-- Builds a KPI alias index so natural wording can map to real dataset columns
-- Provides helper methods for doctors, BUs, KPI metadata, playbooks, and KPI relationships
-
-### `src/data/vector_store.py`
-
-Persistent Chroma knowledge-store layer.
-
-Responsibilities:
-
-- Opens a local Chroma database at `data/chroma_DB`
-- Indexes rows from `data/Knowledge base.xlsx`
-- Indexes KPI catalog aliases generated from the dataset and knowledge base
-- Supports semantic knowledge search for definitions, formulas, owners, drivers, investigation steps, playbooks, and recommended actions
-- Supports KPI-scoped retrieval so results stay focused on the resolved KPI
-
-The store uses a local hash-based embedding function, so it does not need a hosted embedding API.
-
-### `src/analytics/engine.py`
-
-Statistical and operational analytics layer.
-
-Responsibilities:
-
-- Performs root cause analysis
-- Compares current and previous periods
-- Aggregates metrics correctly based on type:
-  - sums for volume and financial metrics
-  - averages for percentages and rates
-- Detects anomalies using Z-scores
-- Ranks doctors by KPI
-- Uses the knowledge-base relationship map to identify KPI drivers
-
-### `src/config.py`
-
-Central configuration file.
-
-Responsibilities:
-
-- Defines model settings
-- Defines hosted LLM settings
-- Defines data paths
-- Defines the Chroma vector-store path
-- Defines default analysis thresholds
-- Defines Gradio host and port
-
-You can override many settings with environment variables.
-
-### `requirements.txt`
-
-Python dependencies needed to run the app.
-
-Main libraries:
-
-- `gradio`
-- `pandas`
-- `numpy`
-- `scipy`
-- `openpyxl`
-- `langchain`
-- `langchain-groq`
-- `chromadb`
-
-### `setup.py`
-
-Optional Python package setup file. Useful if you want to install the project as a local package.
-
 ## Data Files
 
-The app expects these files:
+The app expects:
 
 ```text
 data/OPD dataset.xlsx
 data/Knowledge base.xlsx
 ```
 
-The OPD dataset should include the main KPI table. The current loader expects a sheet named:
+The OPD workbook must contain a sheet named:
 
 ```text
 OPD_KPI_Dataset
 ```
 
-The knowledge base can include KPI definitions, relationship maps, and investigation playbooks. The agent uses it to resolve KPI meaning and explain root causes.
+The knowledge-base workbook can include KPI definitions, formulas, relationship maps, investigation playbooks, owners, driver weights, and recommended actions.
 
-The Chroma database is created automatically at `data/chroma_DB` when the agent starts. Do not upload this generated folder to Hugging Face Spaces or Git. It contains local SQLite/index files and can be rebuilt from `data/Knowledge base.xlsx`.
+## How ChromaDB RAG Works
 
-For Hugging Face Spaces, upload the source code, `requirements.txt`, `README.md`, and the Excel files required by the app. Leave out:
+This project uses a lightweight RAG pattern:
+
+1. The app loads `data/Knowledge base.xlsx`.
+2. `src/data/vector_store.py` indexes knowledge-base rows and KPI catalog aliases into a local persistent ChromaDB collection.
+3. KPI knowledge questions retrieve the most relevant records from Chroma.
+4. The final answer shows readable KPI fields and a concise source line instead of raw retrieved records.
+
+Chroma is used for knowledge retrieval, not numeric calculations. Exact KPI values still come from dataframe analytics.
+
+The local Chroma folder is generated automatically at:
 
 ```text
 data/chroma_DB/
-data/chroma_db/
 ```
 
-## Setup
+Do not upload `data/chroma_DB/` or `data/chroma_db/` to Hugging Face or Git. It contains generated SQLite/index files and can be rebuilt from `data/Knowledge base.xlsx`.
+
+## Application Flow
+
+```mermaid
+flowchart TD
+    A["User question in Gradio"] --> B["Apply optional UI filters"]
+    B --> C["OPDKpiAgent.chat"]
+    C --> D{"Direct structured route?"}
+
+    D -->|Dataset KPI question| E["Pandas + AnalyticsEngine"]
+    E --> F["Exact numeric answer"]
+
+    D -->|Knowledge-base question| G["ChromaDB RAG"]
+    G --> H["Definitions / formulas / owners / playbooks"]
+    H --> F
+
+    D -->|Broader question| I["LangChain agent"]
+    I --> J["Groq ChatGroq model"]
+    J --> K["Tool calls when needed"]
+    K --> E
+    K --> G
+
+    F --> L["Response shown in chat"]
+    J --> L
+```
+
+## Core Modules
+
+### `app.py`
+
+Gradio application entry point.
+
+- Builds the web interface
+- Adds optional filters for BU, doctor-BU profile, year, and KPI
+- Sends user messages to `OPDKpiAgent`
+- Launches the Gradio server
+- Includes a narrow startup-log cleanup hook for a harmless hosted asyncio warning
+
+### `src/agents/kpi_agent.py`
+
+Main intelligence layer.
+
+- Initializes the data loader, analytics engine, Chroma store, Groq model, and LangChain agent
+- Routes common questions to deterministic dataframe or Chroma-backed responses
+- Keeps doctor-BU profiles separate
+- Formats executive readouts, evidence, drivers, and recommendations
+- Blocks invented definitions for unknown KPIs
+
+### `src/data/loader.py`
+
+Data ingestion and KPI metadata layer.
+
+- Loads the OPD dataset workbook
+- Loads every sheet in the knowledge-base workbook
+- Prepares `Date`, `YearMonth`, `Year`, and `Month_Num`
+- Creates derived metrics:
+  - `Revenue_Achievement_%`
+  - `Cases_Achievement_%`
+  - `Revenue_per_Case`
+  - `Leakage_Impact_%`
+- Builds KPI aliases for natural-language resolution
+- Provides doctor-BU profile helpers
+
+### `src/data/vector_store.py`
+
+Persistent ChromaDB knowledge-store layer.
+
+- Opens or creates the local Chroma database
+- Indexes knowledge-base rows
+- Indexes KPI catalog aliases
+- Supports semantic search and KPI-scoped retrieval
+- Uses a local hash-based embedding function, so no hosted embedding API is required
+
+### `src/analytics/engine.py`
+
+Statistical and operational analytics layer.
+
+- Performs root-cause analysis
+- Compares current and previous periods
+- Aggregates sums for volume/financial metrics and averages for percentages/rates
+- Detects anomalies using Z-scores
+- Ranks doctors and doctor-BU profiles by KPI
+- Uses the relationship map to identify KPI drivers
+
+### `src/config.py`
+
+Central configuration file for paths, model settings, thresholds, and server settings.
+
+## Setup Locally
 
 ### 1. Create and activate a virtual environment
 
@@ -219,27 +204,35 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
+If you are using UV-managed Python, create the environment with your preferred UV Python version, then use the `.venv` interpreter for installs and app startup.
+
 ### 2. Install dependencies
 
 ```powershell
 pip install -r requirements.txt
 ```
 
-### 3. Create a Groq API key
+### 3. Set your Groq API key
 
-Create an API key from:
+Create a key from:
 
 ```text
 https://console.groq.com/keys
 ```
 
-Then set it in your terminal:
+Set it in PowerShell:
 
 ```powershell
 $env:GROQ_API_KEY="your_api_key_here"
 ```
 
-The default Groq model is `openai/gpt-oss-120b` with `medium` reasoning effort.
+For a persistent Windows user variable:
+
+```powershell
+setx GROQ_API_KEY "your_api_key_here"
+```
+
+Restart your terminal after `setx`.
 
 ### 4. Run the app
 
@@ -247,21 +240,7 @@ The default Groq model is `openai/gpt-oss-120b` with `medium` reasoning effort.
 python app.py
 ```
 
-For a persistent Windows user environment variable, use:
-
-```powershell
-setx GROQ_API_KEY "your_api_key_here"
-```
-
-Restart your terminal after using `setx`.
-
-By default, the app launches on:
-
-```text
-http://0.0.0.0:7860
-```
-
-On your local machine, open:
+Open:
 
 ```text
 http://127.0.0.1:7860
@@ -269,20 +248,19 @@ http://127.0.0.1:7860
 
 ## Configuration
 
-The default configuration is in `src/config.py`.
-
 Common environment variables:
 
 | Variable | Default | Description |
 |---|---:|---|
-| `GROQ_API_KEY` | Required | Groq API key |
+| `GROQ_API_KEY` | Required for full LLM mode | Groq API key |
 | `LLM_MODEL` | `openai/gpt-oss-120b` | Groq model name |
-| `LLM_REASONING_EFFORT` | `medium` | Reasoning effort for GPT-OSS models: `low`, `medium`, or `high` |
+| `LLM_REASONING_EFFORT` | `medium` | Reasoning effort for GPT-OSS models |
 | `TEMPERATURE` | `0.0` | LLM response randomness |
 | `LLM_MAX_TOKENS` | `1024` | Maximum generated tokens |
 | `LLM_TIMEOUT` | `60` | LLM request timeout in seconds |
-| `LLM_MAX_RETRIES` | `2` | LLM request retry count |
-| `VECTOR_STORE_PATH` | `data/chroma_DB` | Local Chroma database folder |
+| `LLM_MAX_RETRIES` | `2` | LLM retry count |
+| `VECTOR_STORE_PATH` | `data/chroma_DB` | Local generated Chroma database folder |
+| `SERVER_HOST` | `127.0.0.1` locally, `0.0.0.0` on Spaces | Gradio host |
 
 Example:
 
@@ -294,91 +272,61 @@ $env:LLM_MAX_TOKENS="1024"
 python app.py
 ```
 
-## How the Agent Answers Quickly
+## Hugging Face Spaces Deployment
 
-The app uses a hybrid approach:
+This README includes the required Hugging Face Spaces YAML metadata at the top:
 
-1. The user asks a natural-language question.
-2. The agent extracts structured information:
-   - doctor
-   - business unit
-   - year
-   - KPI
-   - threshold
-   - requested operation
-3. If the question maps clearly to a known analytics or knowledge-base operation, the app answers directly from the dataframe, Excel knowledge base, and Chroma.
-4. If the question is broader or ambiguous, the agent can use Groq and LangChain tools.
-
-This keeps simple questions fast while preserving agent-style reasoning for more complex requests.
-
-### LangChain Flow
-
-```mermaid
-flowchart TD
-    A["User question in Gradio"] --> B["Apply selected filters"]
-    B --> C["OPDKpiAgent.chat"]
-    C --> D{"Direct structured match?"}
-
-    D -->|Yes| E["Resolve doctor / BU / KPI / date"]
-    E --> F["Pandas + AnalyticsEngine"]
-    F --> G["Grounded formatted answer"]
-
-    D -->|Knowledge lookup| Q["Chroma KPI knowledge store"]
-    Q --> R["KPI definitions / formulas / playbooks"]
-    R --> G
-
-    D -->|No| H["LangChain create_agent"]
-    H --> I["Groq ChatGroq model"]
-    I --> J{"Tool needed?"}
-    J -->|Yes| K["LangChain tool call"]
-    K --> L["Tool resolves KPI wording"]
-    L --> M["Dataframe / knowledge-base calculation"]
-    M --> N["Tool result returned to model"]
-    N --> O["Final natural-language answer"]
-
-    J -->|No| O
-    G --> P["Response shown in chat"]
-    O --> P
-
-    subgraph Tools["Available LangChain Tools"]
-      T1["get_doctor_performance"]
-      T2["analyze_root_cause"]
-      T3["compare_doctors"]
-      T4["compare_business_units"]
-      T5["get_kpi_trend"]
-      T6["get_bu_summary"]
-      T7["search_kpi_knowledge"]
-    end
-
-    K -. can call .-> Tools
+```yaml
+sdk: gradio
+sdk_version: "6.14.0"
+python_version: "3.11"
+app_file: app.py
 ```
 
-## Knowledge-Base Driven Analysis
+Upload:
 
-The agent uses the knowledge base to avoid inventing KPI relationships.
+```text
+app.py
+requirements.txt
+setup.py
+README.md
+src/
+data/OPD dataset.xlsx
+data/Knowledge base.xlsx
+```
 
-It can read:
+Do not upload:
 
-- KPI definitions
-- KPI formulas
-- Parent and child KPI relationships
-- Driver weights
-- Investigation steps
-- Recommended actions
+```text
+data/chroma_DB/
+data/chroma_db/
+.venv/
+.env
+```
 
-For example, root cause analysis for `Service Leakage %` uses the relationship map to identify drivers such as missed opportunities, workflow compliance, and follow-up behavior when those fields exist in the knowledge base.
-
-For user readability, Chroma retrieval details are summarized as a short source line instead of dumping raw retrieved records into the chat response.
+Set `GROQ_API_KEY` in the Space secrets/settings. The Chroma database will be rebuilt at startup inside the Space from `data/Knowledge base.xlsx`.
 
 ## Questions to Test
 
 Use these prompts after starting the app:
 
 ```text
+Show me Doctor Ahmed's performance, and give me justifications for his KPIs
+```
+
+Expected behavior: returns separate sections for all available Ahmed profiles: `Ahmed (ASH)`, `Ahmed (HJH)`, and `Ahmed (SMH)`.
+
+```text
+Show me Doctor Ahmed's performance in HJH, and give me justifications for his KPIs
+```
+
+Expected behavior: returns only `Ahmed (HJH)`.
+
+```text
 Search the KPI knowledge base for Service Leakage %. Tell me the KPI owner, business question, financial impact formula, primary and secondary drivers, and investigation steps.
 ```
 
-Expected behavior: returns a KPI knowledge lookup only, with owner, formula, drivers, investigation steps, playbook scenarios, and a concise knowledge-source line.
+Expected behavior: returns a Chroma-backed KPI knowledge lookup with a concise source line.
 
 ```text
 What is causing high service leakage in HJH, and what investigation steps should the PA Supervisor follow?
@@ -396,81 +344,68 @@ Expected behavior: returns a BU comparison from the dataframe.
 Which doctors have a no-show rate above 20%?
 ```
 
-Expected behavior: returns doctors matching the threshold.
+Expected behavior: returns doctor-BU profiles matching the threshold.
 
 ```text
-Justify Dr. Mahmoud's PMS performance in ASH.
+What is the definition and calculation formula for the KPI Customer Churn Rate?
 ```
 
-Expected behavior: returns doctor-level KPI justification with peer context and knowledge-base drivers.
-
-```text
-Show the monthly trend for Service Leakage % in HJH for 2025.
-```
-
-Expected behavior: returns a month-by-month trend from the dataset.
+Expected behavior: states that the KPI is not found if it is not configured in the dataset or knowledge base, rather than inventing a formula.
 
 ## Troubleshooting
 
-### Import error from LangChain
+### Hugging Face YAML metadata error
 
-If you see an import error, reinstall dependencies:
+The allowed `colorFrom` and `colorTo` values are:
 
-```powershell
-pip install -r requirements.txt --upgrade
+```text
+red, yellow, green, blue, indigo, purple, pink, gray
 ```
 
-### Groq API key error
+This project uses `green` and `blue`.
 
-Confirm `GROQ_API_KEY` is set in the same terminal where you run the app:
+### Chroma upload hash mismatch on Hugging Face
 
-```powershell
-echo $env:GROQ_API_KEY
+Do not upload the generated Chroma folder. Delete it from the Space repo if it was uploaded:
+
+```text
+data/chroma_DB/
+data/chroma_db/
 ```
 
-Then restart the app. You can also choose a different Groq model:
-
-```powershell
-$env:LLM_MODEL="openai/gpt-oss-120b"
-```
+The app rebuilds Chroma on startup.
 
 ### Very slow answers
 
-The app should answer structured KPI and knowledge-base questions quickly. If a question is slow, it may have fallen back to the LLM.
-
-Try making the question more explicit:
+Structured KPI and knowledge-base questions should answer quickly. If a question is slow, it may have fallen back to the LLM. Make the request more explicit:
 
 ```text
 Compare Patient Retention % across all BUs in 2023
 Search the KPI knowledge base for Service Leakage %
 ```
 
-instead of:
-
-```text
-Tell me about retention
-```
-
 ### Data file not found
 
-Make sure these files exist:
+Confirm these files exist:
 
 ```text
 data/OPD dataset.xlsx
 data/Knowledge base.xlsx
 ```
 
-Also confirm that the OPD workbook contains the `OPD_KPI_Dataset` sheet.
+Also confirm `data/OPD dataset.xlsx` contains the `OPD_KPI_Dataset` sheet.
 
-## Privacy Notes
+### Groq API key error
 
-This project runs the app locally, but Groq inference is hosted. Any text sent to the LLM API is processed by Groq, so avoid sending private healthcare, doctor, patient, or operational details unless that is acceptable for your environment.
+Confirm `GROQ_API_KEY` is set in the same environment where the app runs:
 
-Do not publish private healthcare, doctor, patient, or operational data to a public repository. If the Excel files contain confidential information, keep the repository private or remove/anonymize the files before sharing.
+```powershell
+echo $env:GROQ_API_KEY
+```
 
 ## Development Notes
 
-Useful checks:
+Useful compile check:
 
 ```powershell
 python -m py_compile app.py src\agents\kpi_agent.py src\analytics\engine.py src\data\loader.py src\data\vector_store.py src\config.py
@@ -481,6 +416,12 @@ Run the app:
 ```powershell
 python app.py
 ```
+
+## Privacy Notes
+
+This app can run locally, but Groq inference is hosted. Any text sent to the LLM API is processed by Groq. Avoid sending private healthcare, patient, doctor, or operational details unless that is acceptable for your environment.
+
+Do not publish private healthcare, patient, doctor, or operational data to a public repository. If the Excel files contain confidential information, keep the repository private or remove/anonymize the files before sharing.
 
 ## License
 
