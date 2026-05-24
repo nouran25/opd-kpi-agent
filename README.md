@@ -1,3 +1,15 @@
+---
+title: OPD KPI Intelligence Agent
+emoji: 📊
+colorFrom: green
+colorTo: blue
+sdk: gradio
+sdk_version: "6.14.0"
+python_version: "3.11"
+app_file: app.py
+pinned: false
+---
+
 # OPD KPI Intelligence Agent
 
 An interactive Gradio app for analyzing Outpatient Department (OPD) KPI performance across business units, doctor-BU profiles, time periods, and operational drivers.
@@ -6,6 +18,7 @@ The app uses a hybrid analytics architecture:
 
 - **Dataframe analytics** for exact KPI numbers, trends, comparisons, thresholds, and root-cause calculations.
 - **ChromaDB RAG** for KPI knowledge-base retrieval: definitions, formulas, owners, drivers, investigation steps, playbooks, and recommended actions.
+- **Optional Dataverse formula fallback** through a Power Automate HTTP flow when a formula is missing from the Excel knowledge base.
 - **Groq + LangChain** for broader natural-language reasoning when a request does not map cleanly to a deterministic route.
 
 The model should not guess KPI facts from memory. Numeric answers are grounded in `data/OPD dataset.xlsx`, and knowledge answers are grounded in `data/Knowledge base.xlsx` through Chroma retrieval.
@@ -18,6 +31,7 @@ The model should not guess KPI facts from memory. Numeric answers are grounded i
 - BU comparison across ASH, SMH, and HJH
 - Root-cause analysis using the KPI relationship map
 - Chroma-backed RAG lookup for KPI definitions, formulas, owners, playbooks, and relationships
+- Optional PowerApps/Dataverse lookup for extra KPI formulas not present in `data/Knowledge base.xlsx`
 - KPI trend analysis over time
 - Threshold questions such as doctors above a no-show rate
 - Natural-language KPI resolution, for example `service leakage`, `PMS`, or `patient retention`
@@ -271,6 +285,10 @@ Common environment variables:
 | `LLM_MAX_RETRIES` | `2` | LLM retry count |
 | `VECTOR_STORE_PATH` | `data/chroma_DB` | Local generated Chroma database folder |
 | `SERVER_HOST` | `127.0.0.1` locally, `0.0.0.0` on Spaces | Gradio host |
+| `POWER_AUTOMATE_DATA_REQUEST_URL` | Empty | Optional Power Automate HTTP trigger URL for missing KPI/raw-data requests |
+| `DATA_REQUEST_SOURCE_SYSTEM` | `OPD KPI Agent` | Source-system label sent in missing-data requests |
+| `DATAVERSE_KPI_FORMULA_LOOKUP_URL` | Empty | Optional Power Automate HTTP trigger URL that looks up KPI formulas from Dataverse |
+| `DATAVERSE_FORMULA_SOURCE_LABEL` | `Dataverse KPI formula table` | Source label shown when a formula comes from Dataverse |
 
 Example:
 
@@ -281,6 +299,68 @@ $env:LLM_REASONING_EFFORT="medium"
 $env:LLM_MAX_TOKENS="1024"
 python app.py
 ```
+
+### Dataverse Formula Fallback
+
+If some KPI formulas are not in `data/Knowledge base.xlsx`, create a Dataverse table in PowerApps and expose it through a Power Automate HTTP-trigger flow. The Python app does not need Dataverse credentials; it sends a lookup request to the flow, and the flow queries Dataverse.
+
+Recommended Dataverse table columns:
+
+| Column | Purpose |
+|---|---|
+| `KPI Name` | KPI display name or alias to match user wording |
+| `Formula` | Extra calculation formula |
+| `Definition` | Optional KPI definition |
+| `Owner` | Optional KPI owner or responsible role |
+
+Configure the app:
+
+```powershell
+$env:DATAVERSE_KPI_FORMULA_LOOKUP_URL="https://prod-xx.logic.azure.com/..."
+```
+
+The flow receives:
+
+```json
+{
+  "sourceSystem": "OPD KPI Agent",
+  "requestType": "kpi_formula_lookup",
+  "kpiName": "Customer Churn Rate"
+}
+```
+
+Return either a single JSON object or an array. The app accepts common field names such as `formula`, `Formula`, `Formula_Logic`, `adx_formula`, `kpiName`, `KPI_Name`, `definition`, and `owner`.
+
+Example response:
+
+```json
+{
+  "found": true,
+  "kpiName": "Customer Churn Rate",
+  "formula": "(Patients lost during period / Patients active at start of period) x 100",
+  "definition": "Percentage of active patients who did not return in the measured period.",
+  "owner": "OPD Operations"
+}
+```
+
+When a user asks for a formula, the agent checks the Excel knowledge base first. If the formula is missing or marked as not configured, it calls the Dataverse fallback and labels the answer as coming from the Dataverse KPI formula table.
+
+### Missing KPI / Raw Data Requests
+
+When a user asks for a KPI that needs unavailable patient-level or claims-level raw data, the agent can submit a structured request to a Power Automate flow. Configure the flow with an HTTP trigger, then set:
+
+```powershell
+$env:POWER_AUTOMATE_DATA_REQUEST_URL="https://prod-xx.logic.azure.com/..."
+```
+
+For example, insurance rejection rate by doctor is not available in the current OPD extract because the dataset has `Credit Revenue` but no rejected-claim count, rejected-claim amount, approval status, or rejection reason at patient/claim grain. In that case the agent sends a JSON payload containing:
+
+- requested KPI name
+- unavailable reason
+- required patient/claim raw fields
+- required patient/claim raw fields as one text block in `neededFieldsText`
+- requested grain, such as patient encounter / claim line with doctor, BU, payer, and date
+- recommended numerator and denominator
 
 ## Hugging Face Spaces Deployment
 

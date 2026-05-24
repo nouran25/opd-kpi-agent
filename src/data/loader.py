@@ -165,6 +165,35 @@ class OPDDataLoader:
         matches.sort(reverse=True)
         return matches[0][1]
 
+    def resolve_catalog_kpi(self, text: str) -> str | None:
+        """Resolve user wording to any KPI in the catalog, including non-dataset KPIs."""
+        normalized = self.normalize_lookup_text(text)
+        compact = normalized.replace(" ", "")
+        direct_matches = []
+        fuzzy_matches = []
+
+        for name, item in self.kpi_catalog.items():
+            aliases = item.get("aliases", [])
+            for alias in aliases:
+                alias_compact = alias.replace(" ", "")
+                if normalized == alias or compact == alias_compact:
+                    direct_matches.append((len(alias), name))
+                elif alias and len(alias) >= 3 and (
+                    alias in normalized or alias_compact in compact
+                ):
+                    fuzzy_matches.append((len(alias), name))
+
+        matches = direct_matches or fuzzy_matches
+        if not matches:
+            return None
+
+        matches.sort(reverse=True)
+        return matches[0][1]
+
+    def is_dataset_kpi(self, kpi_name: str) -> bool:
+        item = self.kpi_catalog.get(kpi_name, {})
+        return bool(item.get("dataset_column"))
+
     def resolve_bu(self, text: str) -> str | None:
         normalized = self.normalize_lookup_text(text)
         for bu in self.get_bu_list():

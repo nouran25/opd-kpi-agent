@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import re
 import sys
+import json
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from langchain.agents import create_agent
@@ -168,8 +171,13 @@ class OPDKpiAgent:
 
         @tool
         def search_kpi_knowledge(query: str) -> str:
-            """Search the Chroma KPI knowledge base for definitions, formulas, relationships, investigation steps, and recommended actions."""
+            """Search the Chroma KPI knowledge base for definitions, formulas, relationships, investigation steps, and recommended actions. If a requested formula is not configured there, use the Dataverse formula fallback when configured."""
             return self._search_kpi_knowledge(query)
+
+        @tool
+        def lookup_dataverse_kpi_formula(kpi_name: str) -> str:
+            """Look up a KPI formula in the optional Dataverse formula table when the loaded knowledge base does not contain the formula."""
+            return self._format_dataverse_formula_lookup(kpi_name)
 
         tools = [
             get_doctor_performance,
@@ -179,6 +187,7 @@ class OPDKpiAgent:
             get_kpi_trend,
             get_bu_summary,
             search_kpi_knowledge,
+            lookup_dataverse_kpi_formula,
         ]
 
         if self.llm:
@@ -209,23 +218,30 @@ class OPDKpiAgent:
             "8. Use search_kpi_knowledge when the user asks about KPI definitions, "
             "formulas, playbooks, relationships, recommended actions, or a KPI "
             "whose wording does not resolve cleanly to a dataset column.\n"
-            "9. Explain what the numbers mean operationally. Include drivers, "
+            "9. If search_kpi_knowledge or the loaded knowledge base does not provide "
+            "a configured formula, call lookup_dataverse_kpi_formula before saying the "
+            "formula is unavailable. Clearly label Dataverse formulas as coming from "
+            "the Dataverse KPI formula table.\n"
+            "10. Explain what the numbers mean operationally. Include drivers, "
             "risks, and next actions.\n"
-            "10. Keep answers concise but thorough: executive summary, evidence, "
+            "11. Keep answers concise but thorough: executive summary, evidence, "
             "interpretation, and recommendations.\n"
-            "11. Stay within the 1024-token response limit and finish cleanly. Target "
+            "12. Stay within the 1024-token response limit and finish cleanly. Target "
             "350-500 words, or 250-400 words when using a table.\n"
-            "12. Use tables when they improve clarity, especially for month-by-month "
+            "13. Use tables when they improve clarity, especially for month-by-month "
             "trends, BU comparisons, doctor comparisons, or driver snapshots. Avoid "
             "tables for simple narrative explanations.\n"
-            "13. Keep tables compact: use at most one table unless the user explicitly "
+            "14. Keep tables compact: use at most one table unless the user explicitly "
             "asks for detailed tables, include only the most useful columns, and avoid "
             "wide tables with long text inside cells.\n"
-            "14. Format recommendations as a numbered action list with short bullets "
+            "15. Format recommendations as a numbered action list with short bullets "
             "under each action when useful. Prefer 3 practical recommendations; use "
             "5 only when no table is included or the user asks for depth.\n"
-            "15. If space is limited, prioritize the conclusion, the most important "
+            "16. If space is limited, prioritize the conclusion, the most important "
             "evidence, and actionable recommendations over extra explanation.\n\n"
+            "17. Use 'revenue gap' only for the knowledge-base formula "
+            "Target Revenue - Actual Revenue. For highest-vs-lowest BU comparisons, "
+            "call the difference a BU revenue spread or BU difference.\n\n"
             f"Available BUs: {bus}.\n"
             f"Available doctors include: {doctors}.\n"
             f"Available KPI columns include: {kpis}."
@@ -271,6 +287,7 @@ class OPDKpiAgent:
         year = self._extract_year_from_text(user_input)
         month = self._extract_month_from_text(user_input)
         metric = self.data.resolve_kpi(user_input)
+        catalog_metric = self.data.resolve_catalog_kpi(user_input)
 
         asks_for_justification = any(
             term in normalized
@@ -299,6 +316,8 @@ class OPDKpiAgent:
                 "playbook",
                 "recommended action",
                 "recommendation",
+                "relationship",
+                "related",
             ]
         )
         asks_for_kpi_overview = any(
@@ -312,8 +331,123 @@ class OPDKpiAgent:
             ]
         )
 
+        if self._asks_total_revenue_diagnostic_checklist(normalized):
+            return self._format_total_revenue_diagnostic_checklist(
+                bu=bu,
+                year=year,
+                month=month,
+            )
+
+        if self._asks_doctor_pms_pricing_controls(normalized):
+            return self._format_doctor_pms_pricing_controls()
+
+        if self._asks_revenue_achievement_gap_analysis(normalized):
+            return self._format_revenue_achievement_gap_analysis(
+                year=year,
+                bu=bu,
+            )
+
+        if metric and self._asks_patient_level_unavailable(normalized):
+            return self._format_patient_level_unavailable_request(
+                metric,
+                bu=bu,
+                year=year,
+                month=month,
+            )
+
+        if (
+            metric is None
+            and catalog_metric
+            and not self.data.is_dataset_kpi(catalog_metric)
+            and not asks_for_knowledge
+            and self._asks_for_missing_data_request(normalized)
+        ):
+            derived_response = self._format_dataverse_derived_kpi(
+                catalog_metric,
+                normalized=normalized,
+                bu=bu,
+                year=year,
+                month=month,
+                query=user_input,
+            )
+            if derived_response:
+                return derived_response
+            return self._format_generic_missing_kpi_request(
+                catalog_metric,
+                bu=bu,
+                year=year,
+                month=month,
+                query=user_input,
+            )
+
+        if (
+            metric is None
+            and not asks_for_knowledge
+            and self._asks_for_missing_data_request(normalized)
+        ):
+            requested_kpi = catalog_metric or self._extract_formula_lookup_kpi_name(
+                user_input
+            )
+            derived_response = self._format_dataverse_derived_kpi(
+                requested_kpi,
+                normalized=normalized,
+                bu=bu,
+                year=year,
+                month=month,
+                query=user_input,
+            )
+            if derived_response:
+                return derived_response
+            return self._format_generic_missing_kpi_request(
+                requested_kpi,
+                bu=bu,
+                year=year,
+                month=month,
+                query=user_input,
+            )
+
+        if metric is None and (bu or year or month) and asks_for_kpi_overview:
+            lookup_kpi = self._extract_formula_lookup_kpi_name(user_input)
+            dataverse_formula = self._lookup_dataverse_kpi_formula(lookup_kpi)
+            if dataverse_formula.get("found"):
+                return self._format_dataverse_formula_result(
+                    lookup_kpi,
+                    dataverse_formula,
+                    scope=self._scope_text(bu=bu, year=year, month=month),
+                    value_unavailable=True,
+                )
+
         if asks_for_knowledge and metric is None:
-            return self._unknown_knowledge_kpi_message(user_input)
+            lookup_kpi = self._extract_formula_lookup_kpi_name(user_input)
+            dataverse_formula = self._lookup_dataverse_kpi_formula(lookup_kpi)
+            if dataverse_formula.get("found"):
+                return self._format_dataverse_formula_result(
+                    lookup_kpi,
+                    dataverse_formula,
+                )
+            return self._unknown_knowledge_kpi_message(
+                user_input,
+                dataverse_status=dataverse_formula.get("status", ""),
+            )
+
+        if metric and asks_for_knowledge:
+            lookup_kpi = self._extract_formula_lookup_kpi_name(user_input)
+            if (
+                lookup_kpi
+                and self.data.normalize_lookup_text(lookup_kpi)
+                != self.data.normalize_lookup_text(metric)
+            ):
+                dataverse_formula = self._lookup_dataverse_kpi_formula(lookup_kpi)
+                if dataverse_formula.get("found"):
+                    return self._format_dataverse_formula_result(
+                        lookup_kpi,
+                        dataverse_formula,
+                    )
+                if "formula" in normalized:
+                    return self._unknown_knowledge_kpi_message(
+                        lookup_kpi,
+                        dataverse_status=dataverse_formula.get("status", ""),
+                    )
 
         if metric and asks_for_root_cause and not normalized.startswith("search"):
             root_cause = self._format_root_cause(metric, bu=bu)
@@ -325,7 +459,49 @@ class OPDKpiAgent:
         if metric and asks_for_knowledge:
             return self._format_kpi_knowledge_lookup(metric, user_input)
 
+        if metric and self._asks_for_doctor_ranking(normalized):
+            requested_kpi = self._extract_formula_lookup_kpi_name(user_input)
+            if (
+                requested_kpi
+                and self.data.normalize_lookup_text(requested_kpi)
+                != self.data.normalize_lookup_text(metric)
+            ):
+                derived_response = self._format_dataverse_derived_kpi(
+                    requested_kpi,
+                    normalized=normalized,
+                    bu=bu,
+                    year=year,
+                    month=month,
+                    query=user_input,
+                )
+                if derived_response:
+                    return derived_response
+            return self._format_doctor_comparison(
+                metric,
+                bu=bu,
+                year=year,
+                month=month,
+            )
+
         if metric and asks_for_kpi_overview:
+            requested_kpi = self._extract_formula_lookup_kpi_name(user_input)
+            if (
+                requested_kpi
+                and self.data.normalize_lookup_text(requested_kpi)
+                != self.data.normalize_lookup_text(metric)
+            ):
+                derived_response = self._format_dataverse_derived_kpi(
+                    requested_kpi,
+                    normalized=normalized,
+                    bu=bu,
+                    year=year,
+                    month=month,
+                    query=user_input,
+                )
+                if derived_response:
+                    return derived_response
+            if self._asks_for_kpi_value(normalized, bu=bu, year=year, month=month):
+                return self._format_kpi_value(metric, bu=bu, year=year, month=month)
             return self._format_kpi_knowledge_lookup(metric, user_input)
 
         if doctor and asks_for_justification:
@@ -351,20 +527,1175 @@ class OPDKpiAgent:
 
         return None
 
+    @staticmethod
+    def _asks_for_kpi_value(
+        normalized: str,
+        bu: str | None = None,
+        year: int | None = None,
+        month: int | None = None,
+    ) -> bool:
+        if bu or year or month:
+            return True
+        return any(
+            term in normalized
+            for term in [
+                "value",
+                "current",
+                "latest",
+                "actual",
+                "percentage",
+                "percent",
+                "rate",
+                "score",
+                "how much",
+                "how many",
+            ]
+        )
+
+    @staticmethod
+    def _asks_total_revenue_diagnostic_checklist(normalized: str) -> bool:
+        return (
+            "total revenue" in normalized
+            and any(term in normalized for term in ["diagnostic", "checklist", "diagnosis"])
+        )
+
+    @staticmethod
+    def _asks_doctor_pms_pricing_controls(normalized: str) -> bool:
+        mentions_pms = "doctor pms" in normalized or re.search(r"\bpms\b", normalized)
+        mentions_pricing = any(
+            term in normalized
+            for term in ["pricing", "discount", "charge per case", "price controls"]
+        )
+        mentions_relationship = any(
+            term in normalized
+            for term in ["related", "relationship", "ties", "tie", "linked", "how is"]
+        )
+        return bool(mentions_pms and mentions_pricing and mentions_relationship)
+
+    @staticmethod
+    def _asks_patient_level_unavailable(normalized: str) -> bool:
+        asks_patient_level = any(
+            term in normalized
+            for term in [
+                "patient level",
+                "patient-level",
+                "patient details",
+                "patient detail",
+                "individual patient",
+                "appointment id",
+                "patient id",
+                "patient name",
+                "raw patient",
+            ]
+        )
+        asks_detail = any(
+            term in normalized
+            for term in ["details", "detail", "list", "show", "give me", "raw"]
+        )
+        return asks_patient_level or ("patient" in normalized and asks_detail)
+
+    @staticmethod
+    def _asks_for_missing_data_request(normalized: str) -> bool:
+        return any(
+            term in normalized
+            for term in [
+                "calculate",
+                "what is",
+                "which",
+                "who",
+                "show",
+                "compare",
+                "rank",
+                "highest",
+                "lowest",
+                "trend",
+                "by doctor",
+                "each doctor",
+                "for each doctor",
+                "by bu",
+                "by payer",
+            ]
+        )
+
+    @staticmethod
+    def _asks_for_doctor_ranking(normalized: str) -> bool:
+        mentions_doctor = "doctor" in normalized or "physician" in normalized
+        asks_ranking = any(
+            term in normalized
+            for term in [
+                "which",
+                "who",
+                "highest",
+                "lowest",
+                "top",
+                "rank",
+                "ranking",
+                "compare",
+                "by doctor",
+                "each doctor",
+                "for each doctor",
+            ]
+        )
+        return mentions_doctor and asks_ranking
+
+    @staticmethod
+    def _asks_revenue_achievement_gap_analysis(normalized: str) -> bool:
+        return (
+            "revenue achievement" in normalized
+            and "target" in normalized
+            and any(term in normalized for term in ["gap", "driver", "drivers", "recommendation", "analyze"])
+        )
+
+    def _format_total_revenue_diagnostic_checklist(
+        self,
+        bu: str | None = None,
+        year: int | None = None,
+        month: int | None = None,
+    ) -> str:
+        df = self._scoped_df(bu=bu, year=year, month=month)
+        if df.empty:
+            return f"No Total Revenue diagnostic data{self._scope_text(bu=bu, year=year, month=month)}."
+
+        current, previous = self.analytics._current_previous_periods(df)
+        current_label = self._period_label(current)
+        previous_label = self._period_label(previous)
+        total_revenue = self._sum_metric(current, "Total Revenue")
+        previous_revenue = self._sum_metric(previous, "Total Revenue")
+        revenue_change = self._pct_change(total_revenue, previous_revenue)
+
+        def flag_line(label: str, value: str, status: str, action: str) -> str:
+            return f"- {label}: {value} -> {status}. {action}"
+
+        rows = []
+
+        cases = self._sum_metric(current, "No. Cases")
+        prev_cases = self._sum_metric(previous, "No. Cases")
+        case_change = self._pct_change(cases, prev_cases)
+        rows.append(
+            flag_line(
+                "Case volume",
+                f"{cases:,.0f} cases ({case_change:+.1f}% vs {previous_label})",
+                "FLAG" if case_change <= 0 else "OK",
+                "Drill into BU and doctor case counts if flat or declining.",
+            )
+        )
+
+        charge = self._mean_metric(current, "Charge per case")
+        prev_charge = self._mean_metric(previous, "Charge per case")
+        charge_change = self._pct_change(charge, prev_charge)
+        rows.append(
+            flag_line(
+                "Average yield",
+                f"{self._format_metric_value('Charge per case', charge)} ({charge_change:+.1f}% MoM)",
+                "FLAG" if charge_change < -5 else "OK",
+                "Check case mix, payer mix, pricing, and discount approvals.",
+            )
+        )
+
+        leakage = self._sum_metric(current, "Total Leakage Revenue Losses")
+        leakage_pct = (leakage / total_revenue * 100) if total_revenue else 0
+        rows.append(
+            flag_line(
+                "Leakage",
+                f"{self._format_metric_value('Total Leakage Revenue Losses', leakage)} ({leakage_pct:.1f}% of revenue)",
+                "FLAG" if leakage_pct > 5 else "OK",
+                "Reconcile services rendered against invoices and missed coding.",
+            )
+        )
+
+        cancelled = self._sum_metric(current, "No. Cancelled Clinics")
+        planned_slots = self._sum_metric(current, "No. Planned booking Slots")
+        cancelled_pct = (cancelled / planned_slots * 100) if planned_slots else 0
+        rows.append(
+            flag_line(
+                "Cancelled clinics",
+                f"{cancelled:,.0f} ({cancelled_pct:.1f}% of planned slots)",
+                "FLAG" if cancelled_pct > 3 else "OK",
+                "Review scheduling policy and cancellation notice discipline.",
+            )
+        )
+
+        no_show = self._mean_metric(current, "No-Show %")
+        no_show_pct = no_show * 100 if abs(no_show) <= 1.5 else no_show
+        rows.append(
+            flag_line(
+                "No-show rate",
+                f"{no_show_pct:.1f}%",
+                "FLAG" if no_show_pct > 10 else "OK",
+                "Strengthen reminders and same-day slot-fill workflows.",
+            )
+        )
+
+        cash = self._sum_metric(current, "Cash Revenue")
+        credit = self._sum_metric(current, "Credit Revenue")
+        prev_cash = self._sum_metric(previous, "Cash Revenue")
+        prev_credit = self._sum_metric(previous, "Credit Revenue")
+        credit_cash = (credit / cash) if cash else 0
+        prev_credit_cash = (prev_credit / prev_cash) if prev_cash else 0
+        mix_change = self._pct_change(credit_cash, prev_credit_cash)
+        rows.append(
+            flag_line(
+                "Revenue mix",
+                f"credit/cash {credit_cash:.2f} ({mix_change:+.1f}% MoM)",
+                "FLAG" if mix_change > 5 else "OK",
+                "Check denials, reimbursement aging, and cash-package conversion.",
+            )
+        )
+
+        pms = self._mean_metric(current, "Doctor PMS %")
+        pms_pct = pms * 100 if abs(pms) <= 1.5 else pms
+        rows.append(
+            flag_line(
+                "PMS / pricing-control proxy",
+                f"Doctor PMS {pms_pct:.1f}%",
+                "FLAG" if pms_pct < 90 else "OK",
+                "Use PMS as a supporting signal, then validate charge per case, payer mix, discount approvals, and bundle coding separately.",
+            )
+        )
+
+        coe = self._mean_metric(current, "Actual COE Compliance %")
+        digital = self._mean_metric(current, "Digital Actual CR%")
+        coe_pct = coe * 100 if abs(coe) <= 1.5 else coe
+        digital_pct = digital * 100 if abs(digital) <= 1.5 else digital
+        rows.append(
+            flag_line(
+                "Service-level compliance",
+                f"COE {coe_pct:.1f}%, Digital CR {digital_pct:.1f}%",
+                "FLAG" if coe_pct < 90 or digital_pct < 90 else "OK",
+                "Validate under-billing or rejection risk in non-compliant workflows.",
+            )
+        )
+
+        cancellation_losses = self._sum_metric(
+            current, "Total Losses Revenue_Cancellation_Modification"
+        )
+        cancellation_loss_pct = (
+            cancellation_losses / total_revenue * 100 if total_revenue else 0
+        )
+        rows.append(
+            flag_line(
+                "Cancellation / modification losses",
+                f"{self._format_metric_value('Total Losses Revenue_Cancellation_Modification', cancellation_losses)} ({cancellation_loss_pct:.1f}% of revenue)",
+                "FLAG" if cancellation_loss_pct > 2 else "OK",
+                "Review post-booking cancellation and modification patterns.",
+            )
+        )
+
+        retention = self._mean_metric(current, "Patient Retention %")
+        acquisition = self._mean_metric(current, "Patient Acquisition %")
+        retention_pct = retention * 100 if abs(retention) <= 1.5 else retention
+        acquisition_pct = acquisition * 100 if abs(acquisition) <= 1.5 else acquisition
+        rows.append(
+            flag_line(
+                "Patient retention / acquisition",
+                f"retention {retention_pct:.1f}%, acquisition {acquisition_pct:.1f}%",
+                "FLAG" if retention_pct < 80 else "OK",
+                "Check repeat-visit discipline, follow-up conversion, and acquisition sources.",
+            )
+        )
+
+        flagged_count = sum(1 for row in rows if "-> FLAG." in row)
+        scope = self._scope_text(bu=bu, year=year, month=month)
+        return "\n".join(
+            [
+                f"Total Revenue Diagnostic Checklist{scope}",
+                "",
+                "Executive readout:",
+                (
+                    f"{current_label} Total Revenue is {self._format_metric_value('Total Revenue', total_revenue)}, "
+                    f"changing {revenue_change:+.1f}% versus {previous_label}. "
+                    f"{flagged_count} of 10 diagnostic checks are flagged."
+                ),
+                "",
+                "Latest-month checks:",
+                *rows,
+                "",
+                "Next drill-down:",
+                "- Start with FLAG rows, then compare affected doctors or BUs using the same KPI.",
+                "- For revenue erosion, prioritize case volume, charge per case, leakage, PMS, and cancellation losses first.",
+            ]
+        )
+
+    def _format_doctor_pms_pricing_controls(self) -> str:
+        return "\n".join(
+            [
+                "Doctor PMS % and Pricing / Discount Controls",
+                "",
+                "You are right: in the knowledge base, Doctor PMS % is formally defined as `(Achieved PMS Score / Total PMS Score) x 100`. That makes it a doctor performance/compliance KPI, not a direct discount-control formula.",
+                "",
+                "The relationship to Pricing / Discount Controls is indirect:",
+                "- The relationship map links Doctor PMS % to Revenue Achievement and Compliance Metrics.",
+                "- The relationship map also links Charge per case to Doctor PMS % as a low-weight influence.",
+                "- So PMS can support a pricing investigation, but it should not be used alone as proof of discount leakage or price-policy violation.",
+                "",
+                "Practical use:",
+                "- If Doctor PMS % is low and Charge per case is also falling, investigate pricing, discounts, case mix, payer mix, and bundle coding.",
+                "- If Doctor PMS % is low but Charge per case is stable, treat it primarily as a performance/compliance issue.",
+                "- Discount approvals need their own source KPI or audit data; Doctor PMS % is only a proxy signal.",
+            ]
+        )
+
+    def _format_revenue_achievement_gap_analysis(
+        self,
+        year: int | None = None,
+        bu: str | None = None,
+    ) -> str:
+        selected_year = year or int(self.data.df["Year"].max())
+        df = self._scoped_df(bu=bu, year=selected_year)
+        required = {
+            "Target Revenue",
+            "Total Revenue",
+            "Target No. cases",
+            "No. Cases",
+        }
+        if df.empty or not required.issubset(df.columns):
+            return f"No revenue achievement data found for {selected_year}{self._scope_text(bu=bu)}."
+
+        target_revenue = self._sum_metric(df, "Target Revenue")
+        actual_revenue = self._sum_metric(df, "Total Revenue")
+        gap = target_revenue - actual_revenue
+        achievement = (actual_revenue / target_revenue * 100) if target_revenue else 0
+        target_cases = self._sum_metric(df, "Target No. cases")
+        actual_cases = self._sum_metric(df, "No. Cases")
+        target_yield = target_revenue / target_cases if target_cases else 0
+        actual_yield = actual_revenue / actual_cases if actual_cases else 0
+
+        candidates = [
+            (
+                "Case volume shortfall",
+                max(target_cases - actual_cases, 0) * target_yield,
+                f"{actual_cases:,.0f} cases vs {target_cases:,.0f} target",
+            ),
+            (
+                "Cancellation/modification losses",
+                self._sum_metric(df, "Total Losses Revenue_Cancellation_Modification"),
+                "lost revenue from cancelled or modified activity",
+            ),
+            (
+                "Revenue leakage",
+                self._sum_metric(df, "Total Leakage Revenue Losses"),
+                "missed services or workflow leakage",
+            ),
+            (
+                "Yield per case below target",
+                max(target_yield - actual_yield, 0) * actual_cases,
+                f"${actual_yield:,.0f} actual vs ${target_yield:,.0f} implied target per case",
+            ),
+        ]
+        drivers = sorted(candidates, key=lambda item: item[1], reverse=True)[:3]
+        no_show = self._mean_metric(df, "No-Show %")
+        no_show_pct = no_show * 100 if abs(no_show) <= 1.5 else no_show
+        scope = self._scope_text(bu=bu, year=selected_year)
+
+        lines = [
+            f"Revenue achievement{scope}: {achievement:.1f}% of target.",
+            f"Actual revenue was {self._format_metric_value('Total Revenue', actual_revenue)} vs target {self._format_metric_value('Target Revenue', target_revenue)}, leaving a gap of {self._format_metric_value('Total Revenue', gap)}.",
+            "",
+            "Top 3 possible drivers:",
+        ]
+        for index, (name, impact, detail) in enumerate(drivers, start=1):
+            lines.append(
+                f"{index}. {name}: approx. {self._format_metric_value('Total Revenue', impact)} impact; {detail}."
+            )
+        lines.extend(
+            [
+                "",
+                "Knowledge-base basis: Target Revenue and Total Revenue map the gap to cases, charge per case, leakage, cancelled clinics, and no-show. Average no-show was "
+                f"{no_show_pct:.1f}%, supporting the volume hypothesis.",
+                "",
+                "Executive recommendation: prioritize volume recovery first, then run a cancellation/leakage control sprint by BU and doctor; protect charge per case through payer/service-mix review.",
+                "",
+                "Assumptions and limitations: driver impacts are directional and not additive; the extract is aggregated, so patient, payer, specialty, and rejection-level root causes cannot be proven here.",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _format_generic_missing_kpi_request(
+        self,
+        kpi_name: str,
+        bu: str | None = None,
+        year: int | None = None,
+        month: int | None = None,
+        query: str = "",
+    ) -> str:
+        metadata = self.data.get_kpi_metadata(kpi_name)
+        relationships = self.data.get_kpi_relationships(kpi_name)
+        formula, formula_source, formula_lookup_status = self._formula_with_fallback(
+            kpi_name,
+            query=query,
+        )
+        needed_fields = self._infer_missing_kpi_fields(
+            kpi_name,
+            metadata,
+            relationships,
+            formula=formula,
+        )
+        raw_data_domain = self._infer_raw_data_domain(kpi_name, metadata)
+        if self.data.resolve_catalog_kpi(kpi_name):
+            unavailable_reason = (
+                f"{kpi_name} is configured in the knowledge base or KPI catalog, "
+                "but it is not available as a numeric column in the loaded OPD dataset."
+            )
+        else:
+            unavailable_reason = (
+                f"{kpi_name} is not available as a numeric column in the loaded "
+                "OPD dataset."
+            )
+        request_status = self._submit_missing_data_request(
+            requested_kpi=kpi_name,
+            unavailable_reason=unavailable_reason,
+            needed_fields=needed_fields,
+            raw_data_domain=raw_data_domain,
+            scope={
+                "bu": bu or "all",
+                "year": year or "all",
+                "month": month or "all",
+            },
+            recommended_definition={
+                "name": kpi_name,
+                "numerator": self._infer_formula_part(formula, "numerator"),
+                "denominator": self._infer_formula_part(formula, "denominator"),
+                "grain": self._infer_kpi_grain(kpi_name, metadata),
+            },
+        )
+
+        scope = self._scope_text(bu=bu, year=year, month=month)
+        lines = [
+            f"{kpi_name}{scope}: unavailable in the current dataset",
+            "",
+            "Direct answer:",
+            unavailable_reason,
+            "",
+            "Definition context:",
+            f"- Business question: {metadata.get('Business_Question', 'Not configured')}",
+            f"- Formula: {formula}",
+            f"- Formula source: {formula_source}",
+            *(
+                [f"- Formula lookup status: {formula_lookup_status}"]
+                if formula_lookup_status
+                else []
+            ),
+            f"- Primary driver: {metadata.get('Primary_Driver_KPI', 'Not configured')}",
+            f"- Secondary driver: {metadata.get('Secondary_Driver_KPI', 'Not configured')}",
+            "",
+            "Needed data fields:",
+            self._format_list(needed_fields),
+            "",
+            "Data request:",
+            request_status,
+        ]
+        return "\n".join(lines)
+
+    def _format_patient_level_unavailable_request(
+        self,
+        metric: str,
+        bu: str | None = None,
+        year: int | None = None,
+        month: int | None = None,
+    ) -> str:
+        metadata = self.data.get_kpi_metadata(metric)
+        scope = self._scope_text(bu=bu, year=year, month=month)
+        needed_fields = self._patient_level_needed_fields(metric)
+        unavailable_reason = (
+            f"The loaded OPD dataset contains aggregated {metric} values, but it "
+            "does not include patient-level raw records, appointment IDs, patient "
+            "identifiers, or encounter-level event timestamps needed to list the "
+            "underlying patients."
+        )
+        request_status = self._submit_missing_data_request(
+            requested_kpi=f"Patient-level {metric}",
+            unavailable_reason=unavailable_reason,
+            needed_fields=needed_fields,
+            raw_data_domain=self._infer_patient_level_domain(metric),
+            scope={
+                "bu": bu or "all",
+                "year": year or "all",
+                "month": month or "all",
+            },
+            recommended_definition={
+                "name": f"Patient-level {metric}",
+                "numerator": metric,
+                "denominator": "Patient or appointment-level source records",
+                "grain": self._infer_patient_level_grain(metric),
+            },
+        )
+
+        return "\n".join(
+            [
+                f"Patient-level details for {metric}{scope}: unavailable",
+                "",
+                "Direct answer:",
+                unavailable_reason,
+                "",
+                "What is available now:",
+                "- Aggregated KPI values can be summarized by BU, doctor, and month.",
+                "- Patient-level rows cannot be listed from the current extract.",
+                "",
+                "Knowledge-base context:",
+                f"- Business question: {metadata.get('Business_Question', 'Not configured')}",
+                f"- Formula: {metadata.get('Formula_Logic', metadata.get('Financial_Impact_Formula', 'Not configured'))}",
+                "",
+                "Needed patient-level fields:",
+                self._format_list(needed_fields),
+                "",
+                "Data request:",
+                request_status,
+            ]
+        )
+
+    def _format_dataverse_derived_kpi(
+        self,
+        kpi_name: str,
+        normalized: str,
+        bu: str | None = None,
+        year: int | None = None,
+        month: int | None = None,
+        query: str = "",
+    ) -> str | None:
+        formula_lookup = self._lookup_dataverse_kpi_formula(kpi_name or query)
+        if not formula_lookup.get("found"):
+            return None
+
+        formula = str(formula_lookup.get("formula", ""))
+        numerator_label = self._infer_formula_part(formula, "numerator")
+        denominator_label = self._infer_formula_part(formula, "denominator")
+        numerator_column = self.data.resolve_kpi(numerator_label)
+        denominator_column = self.data.resolve_kpi(denominator_label)
+        if not numerator_column or not denominator_column:
+            return None
+
+        resolved_name = formula_lookup.get("kpi_name") or kpi_name
+        if self._asks_for_doctor_ranking(normalized):
+            return self._format_derived_doctor_comparison(
+                resolved_name,
+                formula,
+                numerator_column,
+                denominator_column,
+                bu=bu,
+                year=year,
+                month=month,
+            )
+
+        return self._format_derived_kpi_value(
+            resolved_name,
+            formula,
+            numerator_column,
+            denominator_column,
+            bu=bu,
+            year=year,
+            month=month,
+        )
+
+    def _format_derived_kpi_value(
+        self,
+        kpi_name: str,
+        formula: str,
+        numerator_column: str,
+        denominator_column: str,
+        bu: str | None = None,
+        year: int | None = None,
+        month: int | None = None,
+    ) -> str:
+        df = self._scoped_df(bu=bu, year=year, month=month)
+        if df.empty:
+            return f"No source data for {kpi_name}{self._scope_text(bu=bu, year=year, month=month)}."
+
+        if not any([bu, year, month]) and "Date" in df.columns:
+            df = df[df["Date"] == df["Date"].max()]
+
+        numerator = self._sum_metric(df, numerator_column)
+        denominator = self._sum_metric(df, denominator_column)
+        value = (numerator / denominator * 100) if denominator else 0.0
+        scope = self._scope_text(bu=bu, year=year, month=month)
+        return "\n".join(
+            [
+                f"{kpi_name}{scope}: {value:.1f}%",
+                "",
+                "Calculated from Dataverse formula:",
+                f"- Formula: {formula}",
+                f"- Numerator: {numerator_column} = {self._format_metric_value(numerator_column, numerator)}",
+                f"- Denominator: {denominator_column} = {self._format_metric_value(denominator_column, denominator)}",
+                f"- Formula source: {self.config.dataverse_formula_source_label}",
+            ]
+        )
+
+    def _format_derived_doctor_comparison(
+        self,
+        kpi_name: str,
+        formula: str,
+        numerator_column: str,
+        denominator_column: str,
+        bu: str | None = None,
+        year: int | None = None,
+        month: int | None = None,
+    ) -> str:
+        df = self._scoped_df(bu=bu, year=year, month=month)
+        required = {"Doctor Name", numerator_column, denominator_column}
+        if bu is None:
+            required.add("BU")
+        if df.empty or not required.issubset(df.columns):
+            return f"No source data for {kpi_name}{self._scope_text(bu=bu, year=year, month=month)}."
+
+        group_columns = ["Doctor Name"] if bu else ["BU", "Doctor Name"]
+        grouped = df.groupby(group_columns)[[numerator_column, denominator_column]].sum().reset_index()
+        grouped[kpi_name] = grouped.apply(
+            lambda row: (
+                row[numerator_column] / row[denominator_column] * 100
+                if row[denominator_column]
+                else 0.0
+            ),
+            axis=1,
+        )
+        grouped = grouped.sort_values(kpi_name, ascending=False).head(5).reset_index(drop=True)
+        grouped["rank"] = grouped.index + 1
+
+        scope = self._scope_text(bu=bu, year=year, month=month)
+        lines = [
+            f"Top doctors by {kpi_name}{scope}:",
+            "",
+            f"Formula from {self.config.dataverse_formula_source_label}: {formula}",
+        ]
+        for _, row in grouped.iterrows():
+            doctor_label = self._doctor_identity_label(row["Doctor Name"], row.get("BU"))
+            lines.append(f"{row['rank']}. {doctor_label}: {row[kpi_name]:.1f}%")
+        return "\n".join(lines)
+
+    def _patient_level_needed_fields(self, metric: str) -> list[str]:
+        metric_lower = metric.lower()
+        common = [
+            "Patient identifier or anonymized patient key",
+            "Encounter or appointment identifier",
+            "Doctor, BU, specialty, and appointment date",
+        ]
+        if "show" in metric_lower:
+            return common + [
+                "Appointment status including booked, attended, cancelled, and no-show",
+                "Scheduled appointment time and check-in or attendance timestamp",
+                "Cancellation timestamp and cancellation reason where applicable",
+                "Reminder delivery and confirmation status where available",
+            ]
+        if "retention" in metric_lower or "acquisition" in metric_lower:
+            return common + [
+                "Visit sequence or first-visit flag",
+                "Previous visit date and follow-up visit date",
+                "Patient new/returning classification",
+            ]
+        if "revenue" in metric_lower or "charge" in metric_lower:
+            return common + [
+                "Service code, payer, billed amount, discount amount, and net revenue",
+                "Invoice or transaction identifier",
+            ]
+        return common + [
+            f"{metric} source value at patient or encounter level",
+            "Source event timestamp and operational status",
+        ]
+
+    def _infer_patient_level_domain(self, metric: str) -> str:
+        metric_lower = metric.lower()
+        if any(term in metric_lower for term in ["show", "booking", "cancelled"]):
+            return "appointments"
+        if any(term in metric_lower for term in ["revenue", "charge", "credit", "cash"]):
+            return "patient_finance"
+        return "patient_encounters"
+
+    def _infer_patient_level_grain(self, metric: str) -> str:
+        metric_lower = metric.lower()
+        if any(term in metric_lower for term in ["show", "booking", "cancelled"]):
+            return "appointment-level row with patient key, appointment ID, doctor, BU, date, and appointment status"
+        if any(term in metric_lower for term in ["revenue", "charge", "credit", "cash"]):
+            return "patient encounter or invoice line with doctor, BU, payer, service, date, and amount"
+        return "patient encounter-level row with patient key, doctor, BU, date, and KPI source event"
+
+    def _infer_missing_kpi_fields(
+        self,
+        kpi_name: str,
+        metadata: dict,
+        relationships,
+        formula: str = "",
+    ) -> list[str]:
+        fields = []
+        numerator = self._infer_formula_part(formula, "numerator")
+        denominator = self._infer_formula_part(formula, "denominator")
+        for value in [numerator, denominator]:
+            if self._is_configured_value(value):
+                fields.append(
+                    f"{value} by BU, doctor, date, and relevant operational grain"
+                )
+
+        kpi_text = self.data.normalize_lookup_text(kpi_name)
+        if not fields and "waiting" in kpi_text:
+            fields.extend(
+                [
+                    "Total patient waiting minutes by BU, doctor, date, and visit",
+                    "Number of attended visits by BU, doctor, and date",
+                ]
+            )
+
+        for value in [
+            kpi_name,
+            metadata.get("Primary_Driver_KPI", ""),
+            metadata.get("Secondary_Driver_KPI", ""),
+        ]:
+            if value and str(value) != "nan" and not fields:
+                fields.append(f"{value} raw value by BU, doctor, date, and relevant operational grain")
+
+        if relationships is not None and not relationships.empty:
+            for _, row in relationships.head(5).iterrows():
+                child = row.get("Child_KPI")
+                if child and str(child) != "nan":
+                    fields.append(
+                        f"{child} raw value by BU, doctor, date, and relevant operational grain"
+                    )
+
+        metadata_formula = str(
+            metadata.get(
+                "Formula_Logic",
+                metadata.get("Financial_Impact_Formula", ""),
+            )
+        )
+        if not fields and metadata_formula and metadata_formula != "nan":
+            fields.append(
+                f"Source fields needed to calculate formula: {metadata_formula}"
+            )
+
+        if not fields:
+            fields.append(f"{kpi_name} source value by BU, doctor, date, and relevant operational grain")
+
+        unique_fields = []
+        for field in fields:
+            if field not in unique_fields:
+                unique_fields.append(field)
+        return unique_fields
+
+    def _infer_raw_data_domain(self, kpi_name: str, metadata: dict) -> str:
+        text = self.data.normalize_lookup_text(
+            " ".join(
+                [
+                    kpi_name,
+                    str(metadata.get("Business_Question", "")),
+                    str(metadata.get("Function_Owner", "")),
+                ]
+            )
+        )
+        if any(term in text for term in ["insurance", "claim", "payer", "credit"]):
+            return "patient_claims"
+        if any(
+            term in text
+            for term in ["booking", "slot", "appointment", "show", "waiting", "wait"]
+        ):
+            return "appointments"
+        if any(term in text for term in ["revenue", "charge", "cash", "finance"]):
+            return "finance"
+        if "patient" in text:
+            return "patient_encounters"
+        return "opd_operations"
+
+    @staticmethod
+    def _infer_formula_part(formula: str, part: str) -> str:
+        formula_text = str(formula).strip()
+        if not formula_text or formula_text == "Not configured":
+            return "To be defined by data owner"
+        if "÷" in formula_text:
+            left, right = formula_text.split("÷", 1)
+            value = left if part == "numerator" else right
+            return re.sub(
+                r"\s*(?:x|\*)\s*100\s*$",
+                "",
+                value,
+                flags=re.IGNORECASE,
+            ).strip(" ()")
+        if "/" in formula_text:
+            left, right = formula_text.split("/", 1)
+            value = left if part == "numerator" else right
+            return re.sub(
+                r"\s*(?:x|\*)\s*100\s*$",
+                "",
+                value,
+                flags=re.IGNORECASE,
+            ).strip(" ()")
+        if part == "numerator":
+            return formula_text
+        return "To be defined by data owner"
+
+    def _infer_kpi_grain(self, kpi_name: str, metadata: dict) -> str:
+        domain = self._infer_raw_data_domain(kpi_name, metadata)
+        if domain == "patient_claims":
+            return "patient encounter / claim line with doctor, BU, payer, and date"
+        if domain == "appointments":
+            return "appointment slot with doctor, BU, date, status, and patient identifier"
+        if domain == "finance":
+            return "transaction or encounter with doctor, BU, payer, service, and date"
+        return "row-level source data with BU, doctor, date, and relevant operational identifiers"
+
+    def _submit_missing_data_request(
+        self,
+        requested_kpi: str,
+        unavailable_reason: str,
+        needed_fields: list[str],
+        raw_data_domain: str,
+        scope: dict | None = None,
+        recommended_definition: dict | None = None,
+    ) -> str:
+        recommended_definition = recommended_definition or {
+            "name": requested_kpi,
+            "numerator": (
+                "Approved claims"
+                if "approval" in requested_kpi.lower()
+                else "Rejected or denied claims"
+            ),
+            "denominator": "Submitted claims",
+            "grain": "patient encounter / claim line with doctor, BU, payer, and date",
+        }
+        payload = {
+            "sourceSystem": self.config.data_request_source_system,
+            "requestedKpi": requested_kpi,
+            "requestType": "missing_kpi_and_raw_data",
+            "unavailableReason": unavailable_reason,
+            "rawDataDomain": raw_data_domain,
+            "neededFields": needed_fields,
+            "neededFieldsText": "\n".join(f"- {field}" for field in needed_fields),
+            "scope": scope or {},
+            "recommendedKpiDefinition": recommended_definition,
+        }
+
+        if not self.config.power_automate_data_request_url:
+            return (
+                "- Power Automate request not sent because "
+                "`POWER_AUTOMATE_DATA_REQUEST_URL` is not configured.\n"
+                "- Configure that environment variable with the flow HTTP trigger URL "
+                "to automatically request the missing KPI and patient-level raw data.\n"
+                f"- Request payload preview: {json.dumps(payload, ensure_ascii=False)}"
+            )
+
+        try:
+            body = json.dumps(payload).encode("utf-8")
+            request = urllib.request.Request(
+                self.config.power_automate_data_request_url,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                response_body = response.read().decode("utf-8", errors="replace")
+            if response_body.strip():
+                return (
+                    "- Missing-data request sent to the Power Automate flow.\n"
+                    f"- Flow response: {self._compact_text(response_body, max_length=300)}"
+                )
+            return "- Missing-data request sent to the Power Automate flow."
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            error_detail = (
+                f"\n- Response body: {self._compact_text(error_body, max_length=600)}"
+                if error_body.strip()
+                else ""
+            )
+            if exc.code == 401:
+                return (
+                    "- Tried to send the missing-data request to Power Automate, but "
+                    "the flow returned 401 Unauthorized.\n"
+                    "- Check the Power Automate HTTP trigger authentication setting. "
+                    "This app currently sends a plain POST request to the trigger URL, "
+                    "so the trigger must either allow anonymous/SAS URL calls or the "
+                    "app must be extended to send the required OAuth token.\n"
+                    "- Also confirm that `POWER_AUTOMATE_DATA_REQUEST_URL` contains the "
+                    "full HTTP POST URL from the trigger, including any query-string "
+                    "signature parameters.\n"
+                    f"{error_detail}\n"
+                    f"- Request payload: {json.dumps(payload, ensure_ascii=False)}"
+                )
+            return (
+                "- Tried to send the missing-data request to Power Automate, but it failed.\n"
+                f"- HTTP status: {exc.code}\n"
+                f"- Error: {exc}\n"
+                f"{error_detail}\n"
+                f"- Request payload: {json.dumps(payload, ensure_ascii=False)}"
+            )
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            return (
+                "- Tried to send the missing-data request to Power Automate, but it failed.\n"
+                f"- Error: {exc}\n"
+                f"- Request payload: {json.dumps(payload, ensure_ascii=False)}"
+            )
+
+    def _lookup_dataverse_kpi_formula(self, kpi_name: str) -> dict:
+        payload = {
+            "sourceSystem": self.config.data_request_source_system,
+            "requestType": "kpi_formula_lookup",
+            "kpiName": str(kpi_name or "").strip(),
+        }
+
+        if not payload["kpiName"]:
+            return {"found": False, "status": "No KPI name provided."}
+
+        if not self.config.dataverse_kpi_formula_lookup_url:
+            return {
+                "found": False,
+                "status": (
+                    "`DATAVERSE_KPI_FORMULA_LOOKUP_URL` is not configured, so "
+                    "Dataverse formula fallback was not checked."
+                ),
+            }
+
+        try:
+            body = json.dumps(payload).encode("utf-8")
+            request = urllib.request.Request(
+                self.config.dataverse_kpi_formula_lookup_url,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                response_body = response.read().decode("utf-8", errors="replace")
+            return self._parse_dataverse_formula_response(response_body)
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            detail = self._compact_text(error_body, max_length=400)
+            status = f"Dataverse formula lookup failed with HTTP {exc.code}."
+            if detail:
+                status += f" Response body: {detail}"
+            return {"found": False, "status": status}
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            return {
+                "found": False,
+                "status": f"Dataverse formula lookup failed: {exc}",
+            }
+
+    def _parse_dataverse_formula_response(self, response_body: str) -> dict:
+        if not str(response_body or "").strip():
+            return {"found": False, "status": "Dataverse formula lookup returned an empty response."}
+
+        try:
+            parsed = json.loads(response_body)
+        except json.JSONDecodeError:
+            return {
+                "found": False,
+                "status": (
+                    "Dataverse formula lookup returned non-JSON content: "
+                    f"{self._compact_text(response_body, max_length=300)}"
+                ),
+            }
+
+        record = parsed
+        if isinstance(parsed, list):
+            record = parsed[0] if parsed else {}
+        elif isinstance(parsed, dict):
+            for key in ("record", "formulaRecord", "value", "items"):
+                value = parsed.get(key)
+                if isinstance(value, list):
+                    record = value[0] if value else {}
+                    break
+                if isinstance(value, dict):
+                    record = value
+                    break
+
+        if not isinstance(record, dict):
+            return {"found": False, "status": "Dataverse formula lookup returned an unsupported JSON shape."}
+
+        formula = self._first_present(
+            record,
+            [
+                "formula",
+                "Formula",
+                "Formula_Logic",
+                "formulaLogic",
+                "adx_formula",
+                "new_formula",
+                "cr_formula",
+            ],
+        )
+        found_value = record.get("found")
+        found = bool(formula) if found_value is None else bool(found_value and formula)
+        if not found:
+            return {
+                "found": False,
+                "status": str(record.get("message") or "No matching Dataverse formula found."),
+            }
+
+        return {
+            "found": True,
+            "kpi_name": self._first_present(
+                record,
+                ["kpiName", "KPI_Name", "KPI", "name", "adx_kpiname", "new_kpiname"],
+            ),
+            "formula": formula,
+            "definition": self._first_present(
+                record,
+                ["definition", "Definition", "description", "adx_definition", "new_definition"],
+            ),
+            "owner": self._first_present(
+                record,
+                ["owner", "Owner", "KPI_Owner_Role", "adx_owner", "new_owner"],
+            ),
+            "status": str(record.get("message") or "Formula found in Dataverse."),
+        }
+
+    @staticmethod
+    def _first_present(record: dict, keys: list[str]) -> str:
+        for key in keys:
+            value = record.get(key)
+            if value is not None and str(value).strip() and str(value).lower() != "nan":
+                return str(value).strip()
+        return ""
+
+    def _is_configured_value(self, value: object) -> bool:
+        text = str(value or "").strip()
+        normalized = self.data.normalize_lookup_text(text)
+        return bool(text) and normalized not in {
+            "",
+            "nan",
+            "none",
+            "null",
+            "not configured",
+            "not available",
+            "to be defined",
+            "tbd",
+            "na",
+            "n a",
+        }
+
+    def _formula_with_fallback(self, metric: str, query: str = "") -> tuple[str, str, str]:
+        metadata = self.data.get_kpi_metadata(metric)
+        formula = metadata.get(
+            "Formula_Logic",
+            metadata.get("Financial_Impact_Formula", "Not configured"),
+        )
+        if self._is_configured_value(formula):
+            return str(formula), "loaded Excel knowledge base", ""
+
+        lookup_key = metric or query
+        dataverse_formula = self._lookup_dataverse_kpi_formula(lookup_key)
+        if dataverse_formula.get("found"):
+            return (
+                str(dataverse_formula.get("formula", "")),
+                self.config.dataverse_formula_source_label,
+                "",
+            )
+        return str(formula or "Not configured"), "not configured", str(dataverse_formula.get("status", ""))
+
+    def _format_dataverse_formula_lookup(self, kpi_name: str) -> str:
+        result = self._lookup_dataverse_kpi_formula(kpi_name)
+        if result.get("found"):
+            return self._format_dataverse_formula_result(kpi_name, result)
+        return (
+            f"No Dataverse formula found for {kpi_name}.\n"
+            f"Status: {result.get('status', 'No details returned.')}"
+        )
+
+    def _extract_formula_lookup_kpi_name(self, query: str) -> str:
+        text = str(query or "").strip()
+        if not text:
+            return text
+
+        patterns = [
+            r"^\s*can\s+you\s+(?:please\s+)?(?:calculate|show|compare|rank)\s+",
+            r"^\s*could\s+you\s+(?:please\s+)?(?:calculate|show|compare|rank)\s+",
+            r"^\s*please\s+(?:calculate|show|compare|rank)\s+",
+            r"^\s*what\s+is\s+the\s+formula\s+(?:of|for)\s+",
+            r"^\s*what\s+is\s+formula\s+(?:of|for)\s+",
+            r"^\s*which\s+doctor\s+(?:caused|has|had|shows|showed)\s+(?:the\s+)?(?:highest|lowest|top|worst|best)\s+",
+            r"^\s*which\s+doctor\s+(?:has|had|shows|showed)\s+",
+            r"^\s*who\s+(?:caused|has|had|shows|showed)\s+(?:the\s+)?(?:highest|lowest|top|worst|best)\s+",
+            r"^\s*(?:show|compare|rank)\s+(?:the\s+)?(?:highest|lowest|top|worst|best)?\s*",
+            r"^\s*what\s+is\s+the\s+",
+            r"^\s*what\s+is\s+",
+            r"^\s*formula\s+(?:of|for)\s+",
+            r"^\s*calculate\s+",
+            r"^\s*calculation\s+(?:of|for)\s+",
+        ]
+        cleaned = text
+        for pattern in patterns:
+            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE).strip()
+
+        cleaned = re.sub(r"^\s*the\s+", "", cleaned, flags=re.IGNORECASE).strip()
+        cleaned = re.sub(
+            r"^\s*doctors?\s+(?:by|per)\s+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+        cleaned = re.sub(r"[?.!]+$", "", cleaned).strip()
+        cleaned = re.sub(
+            r"\b(?:by|per)\s+doctor\b.*$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+        cleaned = re.sub(
+            r"\bfor\s+(?:each|every|all)\s+doctors?\b.*$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+        cleaned = re.sub(
+            r"\b(?:for|by|per)\s+(?:each|every|all)\s+doctors?\b.*$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+        for bu in self.data.get_bu_list():
+            cleaned = re.sub(
+                rf"\s+\b(?:in|for)\s+{re.escape(str(bu))}\b\s*$",
+                "",
+                cleaned,
+                flags=re.IGNORECASE,
+            ).strip()
+        return cleaned or text
+
+    def _format_dataverse_formula_result(
+        self,
+        requested_kpi: str,
+        result: dict,
+        scope: str = "",
+        value_unavailable: bool = False,
+    ) -> str:
+        resolved_name = result.get("kpi_name") or requested_kpi
+        lines = [
+            (
+                f"{resolved_name}{scope}: value unavailable in the current OPD dataset"
+                if value_unavailable
+                else f"Formula for {resolved_name}: {result.get('formula', 'Not configured')}"
+            ),
+            "",
+            f"Source: {self.config.dataverse_formula_source_label}",
+        ]
+        if value_unavailable:
+            lines.extend(
+                [
+                    f"Formula: {result.get('formula', 'Not configured')}",
+                    (
+                        "The formula exists in Dataverse, but the loaded workbook does "
+                        "not contain this KPI as a numeric column, so I should not "
+                        "invent an ASH value."
+                    ),
+                ]
+            )
+        if result.get("definition"):
+            lines.append(f"Definition: {result['definition']}")
+        if result.get("owner"):
+            lines.append(f"Owner: {result['owner']}")
+        return "\n".join(lines)
+
     def _format_kpi_knowledge_lookup(self, metric: str, query: str) -> str:
         metadata = self.data.get_kpi_metadata(metric)
         relationships = self.data.get_kpi_relationships(metric)
         playbook = self.data.get_playbook(metric)
         source_summary = self._kpi_knowledge_source_summary(metric)
+        formula, formula_source, formula_lookup_status = self._formula_with_fallback(
+            metric,
+            query=query,
+        )
+        direct_answer = self._kpi_knowledge_direct_answer(metric, query, metadata, formula)
 
         details = [
-            f"KPI Knowledge Lookup: {metric}",
+            direct_answer,
             "",
-            "Knowledge-base fields:",
+            f"Knowledge-base details for {metric}:",
             f"- Owner: {metadata.get('KPI_Owner_Role', 'Not configured')}",
             f"- Function owner: {metadata.get('Function_Owner', 'Not configured')}",
             f"- Business question: {metadata.get('Business_Question', 'Not configured')}",
-            f"- Formula: {metadata.get('Formula_Logic', metadata.get('Financial_Impact_Formula', 'Not configured'))}",
+            f"- Formula: {formula}",
+            f"- Formula source: {formula_source}",
             f"- Primary driver: {metadata.get('Primary_Driver_KPI', 'Not configured')}",
             f"- Secondary driver: {metadata.get('Secondary_Driver_KPI', 'Not configured')}",
             "",
@@ -401,8 +1732,49 @@ class OPDKpiAgent:
                     line += f". Action: {action}"
                 details.append(line)
 
+        if formula_lookup_status:
+            details.extend(["", f"Dataverse formula fallback: {formula_lookup_status}"])
+
         details.extend(["", f"Knowledge source: {source_summary}"])
         return "\n".join(details)
+
+    def _kpi_knowledge_direct_answer(
+        self,
+        metric: str,
+        query: str,
+        metadata: dict,
+        formula: str,
+    ) -> str:
+        normalized = self.data.normalize_lookup_text(query)
+        if "formula" in normalized or "calculate" in normalized or "calculation" in normalized:
+            return f"Formula for {metric}: {formula}"
+        if "owner" in normalized:
+            return (
+                f"Owner for {metric}: "
+                f"{metadata.get('KPI_Owner_Role', 'Not configured')}"
+            )
+        if "business question" in normalized:
+            return (
+                f"Business question for {metric}: "
+                f"{metadata.get('Business_Question', 'Not configured')}"
+            )
+        if "driver" in normalized or "relationship" in normalized or "related" in normalized:
+            primary = metadata.get("Primary_Driver_KPI", "Not configured")
+            secondary = metadata.get("Secondary_Driver_KPI", "Not configured")
+            return f"Main drivers for {metric}: primary = {primary}; secondary = {secondary}"
+        if "action" in normalized or "recommendation" in normalized:
+            return (
+                f"Recommended action for {metric}: "
+                f"{metadata.get('Recommended_Action', 'Not configured')}"
+            )
+        if any(term in normalized for term in ["what is", "describe", "overview", "tell me about"]):
+            business_question = metadata.get("Business_Question", "Not configured")
+            return (
+                f"{metric} is a KPI used to answer: {business_question}"
+                if business_question != "Not configured" and business_question
+                else f"{metric}: definition not configured in the knowledge base."
+            )
+        return f"Answer for {metric}: see the key knowledge-base fields below."
 
     def _kpi_knowledge_source_summary(self, metric: str) -> str:
         if self.knowledge_store is None:
@@ -726,6 +2098,63 @@ Recommended actions:
         ]
         return "\n".join(lines)
 
+    def _format_kpi_value(
+        self,
+        metric: str,
+        bu: str | None = None,
+        year: int | None = None,
+        month: int | None = None,
+    ) -> str:
+        df = self._scoped_df(bu=bu, year=year, month=month)
+        if metric not in df.columns or df.empty:
+            return f"No data for metric: {metric}{self._scope_text(bu=bu, year=year, month=month)}"
+
+        if not any([bu, year, month]) and "Date" in df.columns:
+            df = df[df["Date"] == df["Date"].max()]
+
+        metric_lower = metric.lower()
+        scope = self._scope_text(bu=bu, year=year, month=month)
+
+        if metric == "Revenue_Achievement_%":
+            actual = self._sum_metric(df, "Total Revenue")
+            target = self._sum_metric(df, "Target Revenue")
+            value = (actual / target * 100) if target else 0
+            return "\n".join(
+                [
+                    f"Revenue Achievement %{scope}: {value:.1f}%",
+                    f"- Actual revenue: {self._format_metric_value('Total Revenue', actual)}",
+                    f"- Target revenue: {self._format_metric_value('Target Revenue', target)}",
+                    "- Formula used: Total Revenue / Target Revenue x 100",
+                ]
+            )
+
+        if metric == "Cases_Achievement_%":
+            actual = self._sum_metric(df, "No. Cases")
+            target = self._sum_metric(df, "Target No. cases")
+            value = (actual / target * 100) if target else 0
+            return "\n".join(
+                [
+                    f"Cases Achievement %{scope}: {value:.1f}%",
+                    f"- Actual cases: {actual:,.0f}",
+                    f"- Target cases: {target:,.0f}",
+                    "- Formula used: No. Cases / Target No. cases x 100",
+                ]
+            )
+
+        aggregate = "sum" if self._is_additive_metric(metric) else "mean"
+        value = self._sum_metric(df, metric) if aggregate == "sum" else self._mean_metric(df, metric)
+        return "\n".join(
+            [
+                f"{metric}{scope}: {self._format_metric_value(metric, value)}",
+                f"- Aggregation used: {aggregate}",
+                (
+                    "- Note: this is a percentage KPI averaged across the selected rows."
+                    if "%" in metric or "cr%" in metric_lower
+                    else "- Note: this is calculated from the selected dataset rows."
+                ),
+            ]
+        )
+
     def _format_doctor_comparison(
         self,
         metric: str,
@@ -785,6 +2214,10 @@ Recommended actions:
         best = ranking.iloc[0]
         worst = ranking.iloc[-1]
 
+        difference_label = (
+            "BU revenue spread" if metric == "Total Revenue" else "BU difference"
+        )
+
         lines = [
             f"BU comparison: {metric}{scope}",
             "",
@@ -794,7 +2227,8 @@ Recommended actions:
                 f"{self._format_metric_value(metric, best[metric])}; "
                 f"{worst['BU']} is lower at "
                 f"{self._format_metric_value(metric, worst[metric])}. "
-                f"The gap is {self._format_metric_value(metric, best[metric] - worst[metric])}. "
+                f"The {difference_label} is "
+                f"{self._format_metric_value(metric, best[metric] - worst[metric])}. "
                 f"This comparison uses {aggregate} aggregation based on the metric type."
             ),
             "",
@@ -809,7 +2243,7 @@ Recommended actions:
             [
                 "",
                 "Recommended actions:",
-                "- Compare the highest and lowest BUs by doctor, specialty, and month to identify where the gap is concentrated.",
+                "- Compare the highest and lowest BUs by doctor, specialty, and month to identify where the spread is concentrated.",
                 "- Use the KPI relationship map to check the strongest operational drivers before deciding on corrective actions.",
             ]
         )
@@ -1071,7 +2505,15 @@ Doctor: {doctor_label}
         return "\n".join(lines)
 
     def _search_kpi_knowledge(self, query: str, metric: str | None = None) -> str:
+        normalized_query = self.data.normalize_lookup_text(query)
+        asks_formula = any(
+            term in normalized_query
+            for term in ["formula", "calculate", "calculation"]
+        )
+
         if self.knowledge_store is None:
+            if asks_formula:
+                return self._format_dataverse_formula_lookup(metric or query)
             return (
                 "The Chroma knowledge store is not available. The agent can still "
                 "use the loaded Excel knowledge base through its analytics tools."
@@ -1082,6 +2524,8 @@ Doctor: {doctor_label}
         else:
             results = self.knowledge_store.search(query, limit=5)
         if not results:
+            if asks_formula:
+                return self._format_dataverse_formula_lookup(metric or query)
             return f"No Chroma knowledge-base results found for: {query}"
 
         lines = [f"Chroma knowledge-base results for: {query}"]
@@ -1194,6 +2638,30 @@ Doctor: {doctor_label}
         )
         return "\n".join(lines)
 
+    @staticmethod
+    def _period_label(df) -> str:
+        if df.empty or "YearMonth" not in df.columns:
+            return "selected period"
+        value = df["YearMonth"].dropna()
+        return str(value.iloc[0]) if not value.empty else "selected period"
+
+    @staticmethod
+    def _sum_metric(df, metric: str) -> float:
+        if df.empty or metric not in df.columns:
+            return 0.0
+        return float(df[metric].dropna().sum())
+
+    @staticmethod
+    def _mean_metric(df, metric: str) -> float:
+        if df.empty or metric not in df.columns:
+            return 0.0
+        values = df[metric].dropna()
+        return float(values.mean()) if not values.empty else 0.0
+
+    @staticmethod
+    def _pct_change(current: float, previous: float) -> float:
+        return ((current - previous) / previous * 100) if previous else 0.0
+
     def _format_metric_value(self, metric: str, value: float | int | None) -> str:
         if value is None:
             return "N/A"
@@ -1205,7 +2673,7 @@ Doctor: {doctor_label}
                 numeric_value * 100 if abs(numeric_value) <= 1.5 else numeric_value
             )
             return f"{display_value:.1f}%"
-        if any(word in metric_lower for word in ["revenue", "losses"]):
+        if any(word in metric_lower for word in ["revenue", "losses", "charge"]):
             return f"${numeric_value:,.0f}"
         if any(
             word in metric_lower
@@ -1597,17 +3065,22 @@ Doctor: {doctor_label}
             f"{', '.join(self._available_kpi_columns()[:20])}"
         )
 
-    def _unknown_knowledge_kpi_message(self, query: str) -> str:
+    def _unknown_knowledge_kpi_message(
+        self,
+        query: str,
+        dataverse_status: str = "",
+    ) -> str:
         suggestions = self._knowledge_kpi_suggestions(query)
         suggestion_text = (
             f" Closest available KPI(s): {', '.join(suggestions)}."
             if suggestions
             else ""
         )
+        dataverse_text = f" Dataverse fallback: {dataverse_status}" if dataverse_status else ""
         return (
             "I could not find that KPI in the loaded dataset or KPI knowledge base, "
             "so I should not provide a definition or formula for it as if it were "
-            f"configured.{suggestion_text}"
+            f"configured.{suggestion_text}{dataverse_text}"
         )
 
     def _knowledge_kpi_suggestions(self, query: str) -> list[str]:

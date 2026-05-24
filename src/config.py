@@ -45,6 +45,26 @@ class Config:
     server_host: str = os.getenv("SERVER_HOST", default_server_host)
     server_port: int = 7860
 
+    # Optional Power Automate data-request flow
+    power_automate_data_request_url: str = os.getenv(
+        "POWER_AUTOMATE_DATA_REQUEST_URL",
+        "",
+    )
+    data_request_source_system: str = os.getenv(
+        "DATA_REQUEST_SOURCE_SYSTEM",
+        "OPD KPI Agent",
+    )
+
+    # Optional Power Automate Dataverse formula lookup flow
+    dataverse_kpi_formula_lookup_url: str = os.getenv(
+        "DATAVERSE_KPI_FORMULA_LOOKUP_URL",
+        "",
+    )
+    dataverse_formula_source_label: str = os.getenv(
+        "DATAVERSE_FORMULA_SOURCE_LABEL",
+        "Dataverse KPI formula table",
+    )
+
     def ensure_directories(self):
         """Create necessary directories"""
         self.dataset_path.parent.mkdir(parents=True, exist_ok=True)
