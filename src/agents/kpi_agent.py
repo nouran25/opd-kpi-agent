@@ -43,6 +43,8 @@ class OPDKpiAgent:
         self.llm = None
         self.agent_executor = None
         self.chat_history = []
+        self.pending_missing_kpi_request = None
+        self.missing_kpi_approval_cache = {}
 
         self._init_llm()
         self._create_agent()
@@ -264,6 +266,13 @@ class OPDKpiAgent:
             return self._fallback_response()
 
         try:
+            pending_response = self._handle_pending_missing_kpi_formula(user_input)
+            if pending_response:
+                self.chat_history.extend(
+                    [HumanMessage(user_input), AIMessage(pending_response)]
+                )
+                return pending_response
+
             direct_response = self._direct_structured_response(user_input)
             if direct_response:
                 self.chat_history.extend(
@@ -408,7 +417,9 @@ class OPDKpiAgent:
 
         if metric is None and (bu or year or month) and asks_for_kpi_overview:
             lookup_kpi = self._extract_formula_lookup_kpi_name(user_input)
-            dataverse_formula = self._lookup_dataverse_kpi_formula(lookup_kpi)
+            dataverse_formula = self._lookup_dataverse_kpi_formula_candidates(
+                lookup_kpi,
+            )
             if dataverse_formula.get("found"):
                 return self._format_dataverse_formula_result(
                     lookup_kpi,
@@ -419,7 +430,9 @@ class OPDKpiAgent:
 
         if asks_for_knowledge and metric is None:
             lookup_kpi = self._extract_formula_lookup_kpi_name(user_input)
-            dataverse_formula = self._lookup_dataverse_kpi_formula(lookup_kpi)
+            dataverse_formula = self._lookup_dataverse_kpi_formula_candidates(
+                lookup_kpi,
+            )
             if dataverse_formula.get("found"):
                 return self._format_dataverse_formula_result(
                     lookup_kpi,
@@ -437,16 +450,14 @@ class OPDKpiAgent:
                 and self.data.normalize_lookup_text(lookup_kpi)
                 != self.data.normalize_lookup_text(metric)
             ):
-                dataverse_formula = self._lookup_dataverse_kpi_formula(lookup_kpi)
+                dataverse_formula = self._lookup_dataverse_kpi_formula_candidates(
+                    lookup_kpi,
+                    fallback=metric,
+                )
                 if dataverse_formula.get("found"):
                     return self._format_dataverse_formula_result(
                         lookup_kpi,
                         dataverse_formula,
-                    )
-                if "formula" in normalized:
-                    return self._unknown_knowledge_kpi_message(
-                        lookup_kpi,
-                        dataverse_status=dataverse_formula.get("status", ""),
                     )
 
         if metric and asks_for_root_cause and not normalized.startswith("search"):
@@ -917,13 +928,19 @@ class OPDKpiAgent:
         year: int | None = None,
         month: int | None = None,
         query: str = "",
+        provided_formula: str = "",
     ) -> str:
         metadata = self.data.get_kpi_metadata(kpi_name)
         relationships = self.data.get_kpi_relationships(kpi_name)
-        formula, formula_source, formula_lookup_status = self._formula_with_fallback(
-            kpi_name,
-            query=query,
-        )
+        if provided_formula:
+            formula = provided_formula
+            formula_source = "user-provided formula pending data-owner approval"
+            formula_lookup_status = ""
+        else:
+            formula, formula_source, formula_lookup_status = self._formula_with_fallback(
+                kpi_name,
+                query=query,
+            )
         needed_fields = self._infer_missing_kpi_fields(
             kpi_name,
             metadata,
@@ -941,6 +958,52 @@ class OPDKpiAgent:
                 f"{kpi_name} is not available as a numeric column in the loaded "
                 "OPD dataset."
             )
+        if not provided_formula and not self._is_configured_value(formula):
+            existing_status = self._lookup_missing_kpi_approval_status(
+                kpi_name,
+                unavailable_reason=unavailable_reason,
+                needed_fields=needed_fields,
+                raw_data_domain=raw_data_domain,
+                scope={
+                    "bu": bu or "all",
+                    "year": year or "all",
+                    "month": month or "all",
+                },
+            )
+            if existing_status:
+                return existing_status
+
+            self.pending_missing_kpi_request = {
+                "kpi_name": kpi_name,
+                "bu": bu,
+                "year": year,
+                "month": month,
+                "query": query,
+            }
+            scope = self._scope_text(bu=bu, year=year, month=month)
+            return "\n".join(
+                [
+                    f"{kpi_name}{scope}: unavailable in the current dataset",
+                    "",
+                    "Direct answer:",
+                    unavailable_reason,
+                    "",
+                    "Formula needed:",
+                    "I could not find a configured formula for this KPI in the knowledge base or Dataverse formula lookup.",
+                    f"Please write the formula for {kpi_name}, for example:",
+                    f"{kpi_name} = Numerator / Denominator x 100",
+                    "",
+                    "After you send the formula, I will submit the missing-KPI request with the formula so the table owner can approve or reject it.",
+                    "",
+                    "Needed data fields:",
+                    self._format_list(needed_fields),
+                    *(
+                        ["", f"Formula lookup status: {formula_lookup_status}"]
+                        if formula_lookup_status
+                        else []
+                    ),
+                ]
+            )
         request_status = self._submit_missing_data_request(
             requested_kpi=kpi_name,
             unavailable_reason=unavailable_reason,
@@ -953,10 +1016,12 @@ class OPDKpiAgent:
             },
             recommended_definition={
                 "name": kpi_name,
+                "formula": formula,
                 "numerator": self._infer_formula_part(formula, "numerator"),
                 "denominator": self._infer_formula_part(formula, "denominator"),
                 "grain": self._infer_kpi_grain(kpi_name, metadata),
             },
+            requested_formula=formula,
         )
 
         scope = self._scope_text(bu=bu, year=year, month=month)
@@ -1014,10 +1079,12 @@ class OPDKpiAgent:
             },
             recommended_definition={
                 "name": f"Patient-level {metric}",
+                "formula": metric,
                 "numerator": metric,
                 "denominator": "Patient or appointment-level source records",
                 "grain": self._infer_patient_level_grain(metric),
             },
+            requested_formula=metric,
         )
 
         return "\n".join(
@@ -1043,6 +1110,194 @@ class OPDKpiAgent:
             ]
         )
 
+    def _lookup_missing_kpi_approval_status(
+        self,
+        kpi_name: str,
+        unavailable_reason: str,
+        needed_fields: list[str],
+        raw_data_domain: str,
+        scope: dict,
+    ) -> str | None:
+        """Ask the Power Automate flow whether this missing KPI already has a decision."""
+        if not self.config.power_automate_data_request_url:
+            return self._format_cached_missing_kpi_approval_status(kpi_name)
+
+        payload = {
+            "sourceSystem": self.config.data_request_source_system,
+            "requestedKpi": kpi_name,
+            "normalizedKpiKey": self.data.normalize_lookup_text(kpi_name),
+            "requestType": "missing_kpi_approval_lookup",
+            "approvalLookupOnly": True,
+            "unavailableReason": unavailable_reason,
+            "rawDataDomain": raw_data_domain,
+            "requestedFormula": "",
+            "neededFields": needed_fields,
+            "neededFieldsText": "\n".join(f"- {field}" for field in needed_fields),
+            "scope": scope,
+            "recommendedKpiDefinition": {
+                "name": kpi_name,
+                "formula": "",
+                "numerator": "To be defined by data owner",
+                "denominator": "To be defined by data owner",
+                "grain": "row-level source data with BU, doctor, date, and relevant operational identifiers",
+            },
+        }
+
+        try:
+            body = json.dumps(payload).encode("utf-8")
+            request = urllib.request.Request(
+                self.config.power_automate_data_request_url,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                response_body = response.read().decode("utf-8", errors="replace")
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
+            return self._format_cached_missing_kpi_approval_status(kpi_name)
+
+        result = self._parse_json_response(response_body)
+        status = str(result.get("status", "")).strip()
+        normalized_status = self.data.normalize_lookup_text(status)
+        if normalized_status not in {"pending", "rejected", "approved"}:
+            return self._format_cached_missing_kpi_approval_status(kpi_name)
+
+        message = str(result.get("message", "")).strip()
+        rejected_reason = str(result.get("rejectedReason", "")).strip()
+        self._cache_missing_kpi_approval_status(
+            kpi_name,
+            status=status,
+            message=message,
+            rejected_reason=rejected_reason,
+        )
+        return self._format_cached_missing_kpi_approval_status(kpi_name)
+
+    def _cache_missing_kpi_approval_status(
+        self,
+        kpi_name: str,
+        status: str,
+        message: str = "",
+        rejected_reason: str = "",
+    ) -> None:
+        key = self.data.normalize_lookup_text(kpi_name)
+        if not key or self.data.normalize_lookup_text(status) not in {
+            "pending",
+            "rejected",
+            "approved",
+        }:
+            return
+        self.missing_kpi_approval_cache[key] = {
+            "kpi_name": kpi_name,
+            "status": status,
+            "message": message,
+            "rejectedReason": rejected_reason,
+        }
+
+    def _format_cached_missing_kpi_approval_status(self, kpi_name: str) -> str | None:
+        cached = self.missing_kpi_approval_cache.get(
+            self.data.normalize_lookup_text(kpi_name),
+        )
+        if not cached:
+            return None
+
+        status = str(cached.get("status", "")).strip()
+        normalized_status = self.data.normalize_lookup_text(status)
+        message = str(cached.get("message", "")).strip()
+        rejected_reason = str(cached.get("rejectedReason", "")).strip()
+        lines = [
+            f"{kpi_name}: unavailable in the current dataset",
+            "",
+            f"Approval status: {status}",
+        ]
+        if message:
+            lines.extend(["", message])
+        if rejected_reason:
+            lines.extend(["", f"Rejected reason: {rejected_reason}"])
+        if normalized_status == "pending":
+            lines.extend(
+                [
+                    "",
+                    "This KPI is already in the missing-KPI approval flow. I will not submit a duplicate request.",
+                ]
+            )
+        elif normalized_status == "rejected":
+            lines.extend(
+                [
+                    "",
+                    "This KPI was rejected by the data owner, so I will not submit another request.",
+                ]
+            )
+        elif normalized_status == "approved":
+            lines.extend(
+                [
+                    "",
+                    "This KPI has been approved. If I still cannot answer it, the OPD dataset has not been refreshed with the approved KPI yet.",
+                ]
+            )
+        return "\n".join(lines)
+
+    def _handle_pending_missing_kpi_formula(self, user_input: str) -> str | None:
+        if not self.pending_missing_kpi_request:
+            return None
+
+        normalized = self.data.normalize_lookup_text(user_input)
+        if normalized in {"cancel", "stop", "never mind", "nevermind"}:
+            kpi_name = self.pending_missing_kpi_request.get("kpi_name", "the KPI")
+            self.pending_missing_kpi_request = None
+            return f"Okay, I cancelled the missing-KPI request for {kpi_name}."
+
+        formula = self._extract_user_provided_formula(user_input)
+        if not formula:
+            kpi_name = self.pending_missing_kpi_request.get("kpi_name", "this KPI")
+            return (
+                f"Please send the formula for {kpi_name}, for example: "
+                f"{kpi_name} = Numerator / Denominator x 100. "
+                "Send `cancel` if you do not want to submit the request."
+            )
+
+        pending = self.pending_missing_kpi_request
+        self.pending_missing_kpi_request = None
+        return self._format_generic_missing_kpi_request(
+            pending["kpi_name"],
+            bu=pending.get("bu"),
+            year=pending.get("year"),
+            month=pending.get("month"),
+            query=pending.get("query", ""),
+            provided_formula=formula,
+        )
+
+    def _extract_user_provided_formula(self, user_input: str) -> str:
+        text = str(user_input or "").strip()
+        if not text:
+            return ""
+
+        text = re.sub(
+            r"^\s*(?:the\s+)?formula\s+(?:is|=|:)\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
+        text = re.sub(r"[.]+$", "", text).strip()
+        if not text:
+            return ""
+
+        normalized = self.data.normalize_lookup_text(text)
+        formula_terms = {
+            "divided",
+            "denominator",
+            "formula",
+            "minus",
+            "numerator",
+            "over",
+            "plus",
+            "rate",
+            "ratio",
+            "total",
+        }
+        has_operator = bool(re.search(r"[=/÷+\-*]", text)) or " x " in f" {text.lower()} "
+        has_formula_word = bool(set(normalized.split()) & formula_terms)
+        return text if has_operator or has_formula_word else ""
+
     def _format_dataverse_derived_kpi(
         self,
         kpi_name: str,
@@ -1052,7 +1307,10 @@ class OPDKpiAgent:
         month: int | None = None,
         query: str = "",
     ) -> str | None:
-        formula_lookup = self._lookup_dataverse_kpi_formula(kpi_name or query)
+        formula_lookup = self._lookup_dataverse_kpi_formula_candidates(
+            kpi_name or query,
+            fallback=query,
+        )
         if not formula_lookup.get("found"):
             return None
 
@@ -1295,6 +1553,8 @@ class OPDKpiAgent:
         formula_text = str(formula).strip()
         if not formula_text or formula_text == "Not configured":
             return "To be defined by data owner"
+        if "=" in formula_text:
+            formula_text = formula_text.split("=", 1)[1].strip()
         if "÷" in formula_text:
             left, right = formula_text.split("÷", 1)
             value = left if part == "numerator" else right
@@ -1335,9 +1595,11 @@ class OPDKpiAgent:
         raw_data_domain: str,
         scope: dict | None = None,
         recommended_definition: dict | None = None,
+        requested_formula: str = "",
     ) -> str:
         recommended_definition = recommended_definition or {
             "name": requested_kpi,
+            "formula": requested_formula or "To be defined by data owner",
             "numerator": (
                 "Approved claims"
                 if "approval" in requested_kpi.lower()
@@ -1349,9 +1611,12 @@ class OPDKpiAgent:
         payload = {
             "sourceSystem": self.config.data_request_source_system,
             "requestedKpi": requested_kpi,
+            "normalizedKpiKey": self.data.normalize_lookup_text(requested_kpi),
             "requestType": "missing_kpi_and_raw_data",
             "unavailableReason": unavailable_reason,
             "rawDataDomain": raw_data_domain,
+            "requestedFormula": requested_formula
+            or recommended_definition.get("formula", ""),
             "neededFields": needed_fields,
             "neededFieldsText": "\n".join(f"- {field}" for field in needed_fields),
             "scope": scope or {},
@@ -1377,6 +1642,14 @@ class OPDKpiAgent:
             )
             with urllib.request.urlopen(request, timeout=10) as response:
                 response_body = response.read().decode("utf-8", errors="replace")
+            flow_result = self._parse_json_response(response_body)
+            if flow_result.get("status"):
+                self._cache_missing_kpi_approval_status(
+                    requested_kpi,
+                    status=str(flow_result.get("status", "")),
+                    message=str(flow_result.get("message", "")),
+                    rejected_reason=str(flow_result.get("rejectedReason", "")),
+                )
             if response_body.strip():
                 return (
                     "- Missing-data request sent to the Power Automate flow.\n"
@@ -1417,6 +1690,39 @@ class OPDKpiAgent:
                 f"- Error: {exc}\n"
                 f"- Request payload: {json.dumps(payload, ensure_ascii=False)}"
             )
+
+    def _lookup_dataverse_kpi_formula_candidates(
+        self,
+        kpi_name: str,
+        fallback: str = "",
+    ) -> dict:
+        candidates = []
+
+        def add_many(values):
+            for value in values:
+                text = str(value or "").strip()
+                if text and text not in candidates:
+                    candidates.append(text)
+
+        add_many(self.data.get_kpi_lookup_candidates(kpi_name))
+        if fallback:
+            add_many(self.data.get_kpi_lookup_candidates(fallback))
+
+        last_result = {"found": False, "status": "No KPI name provided."}
+        for candidate in candidates:
+            result = self._lookup_dataverse_kpi_formula(candidate)
+            if result.get("found"):
+                result["lookup_name"] = candidate
+                return result
+            last_result = result
+
+        if candidates and last_result.get("status"):
+            last_result = dict(last_result)
+            last_result["status"] = (
+                f"{last_result.get('status')} Checked aliases: "
+                f"{', '.join(candidates[:8])}."
+            )
+        return last_result
 
     def _lookup_dataverse_kpi_formula(self, kpi_name: str) -> dict:
         payload = {
@@ -1538,6 +1844,13 @@ class OPDKpiAgent:
                 return str(value).strip()
         return ""
 
+    def _parse_json_response(self, response_body: str) -> dict:
+        try:
+            parsed = json.loads(response_body or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
     def _is_configured_value(self, value: object) -> bool:
         text = str(value or "").strip()
         normalized = self.data.normalize_lookup_text(text)
@@ -1563,8 +1876,10 @@ class OPDKpiAgent:
         if self._is_configured_value(formula):
             return str(formula), "loaded Excel knowledge base", ""
 
-        lookup_key = metric or query
-        dataverse_formula = self._lookup_dataverse_kpi_formula(lookup_key)
+        dataverse_formula = self._lookup_dataverse_kpi_formula_candidates(
+            query or metric,
+            fallback=metric,
+        )
         if dataverse_formula.get("found"):
             return (
                 str(dataverse_formula.get("formula", "")),
@@ -1574,7 +1889,7 @@ class OPDKpiAgent:
         return str(formula or "Not configured"), "not configured", str(dataverse_formula.get("status", ""))
 
     def _format_dataverse_formula_lookup(self, kpi_name: str) -> str:
-        result = self._lookup_dataverse_kpi_formula(kpi_name)
+        result = self._lookup_dataverse_kpi_formula_candidates(kpi_name)
         if result.get("found"):
             return self._format_dataverse_formula_result(kpi_name, result)
         return (
