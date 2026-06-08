@@ -43,7 +43,6 @@ class OPDKpiAgent:
         self.llm = None
         self.agent_executor = None
         self.chat_history = []
-        self.pending_missing_kpi_request = None
         self.missing_kpi_approval_cache = {}
 
         self._init_llm()
@@ -262,17 +261,7 @@ class OPDKpiAgent:
 
     def chat(self, user_input: str) -> str:
         """Process user message."""
-        if self.agent_executor is None:
-            return self._fallback_response()
-
         try:
-            pending_response = self._handle_pending_missing_kpi_formula(user_input)
-            if pending_response:
-                self.chat_history.extend(
-                    [HumanMessage(user_input), AIMessage(pending_response)]
-                )
-                return pending_response
-
             direct_response = self._direct_structured_response(user_input)
             if direct_response:
                 self.chat_history.extend(
@@ -280,23 +269,47 @@ class OPDKpiAgent:
                 )
                 return direct_response
 
+            if self.agent_executor is None:
+                return self._fallback_response()
+
             messages = self.chat_history + [HumanMessage(user_input)]
             response = self.agent_executor.invoke({"messages": messages})
             output = self._message_content_to_text(response["messages"][-1])
             self.chat_history.extend([HumanMessage(user_input), AIMessage(output)])
             return output
         except Exception as exc:
-            return f"Error: {exc}"
+            return self._format_agent_error(exc)
 
     def _direct_structured_response(self, user_input: str) -> str | None:
         """Answer common KPI requests deterministically from the loaded dataset."""
-        normalized = self.data.normalize_lookup_text(user_input)
+        message_parts = user_input.split(
+            "\n\nUse these selected filters:",
+            maxsplit=1,
+        )
+        conversational_query = message_parts[0]
+        filter_context = message_parts[1] if len(message_parts) > 1 else ""
+        conversational_normalized = self.data.normalize_lookup_text(
+            conversational_query
+        )
+        normalized = conversational_normalized
+        conversational_response = self._conversational_response(
+            conversational_normalized,
+            raw_text=conversational_query,
+        )
+        if conversational_response:
+            return conversational_response
+
         doctor = self._extract_doctor_from_text(user_input)
         bu = self._extract_bu_from_text(user_input)
         year = self._extract_year_from_text(user_input)
         month = self._extract_month_from_text(user_input)
-        metric = self.data.resolve_kpi(user_input)
-        catalog_metric = self.data.resolve_catalog_kpi(user_input)
+        metric = self.data.resolve_kpi(conversational_query)
+        catalog_metric = self.data.resolve_catalog_kpi(conversational_query)
+        if not metric and filter_context:
+            selected_kpi = self._extract_kpi_filter(filter_context)
+            if selected_kpi:
+                metric = self.data.resolve_kpi(selected_kpi)
+                catalog_metric = self.data.resolve_catalog_kpi(selected_kpi)
 
         asks_for_justification = any(
             term in normalized
@@ -340,6 +353,12 @@ class OPDKpiAgent:
             ]
         )
 
+        if self._asks_overall_target_progress(normalized):
+            return self._format_overall_target_progress()
+
+        if self._asks_most_declining_bu(normalized):
+            return self._format_most_declining_bu()
+
         if self._asks_total_revenue_diagnostic_checklist(normalized):
             return self._format_total_revenue_diagnostic_checklist(
                 bu=bu,
@@ -362,6 +381,28 @@ class OPDKpiAgent:
                 bu=bu,
                 year=year,
                 month=month,
+                submit_request=True,
+            )
+
+        if doctor and asks_for_justification:
+            if not bu and self._doctor_has_multiple_bus(doctor):
+                if metric:
+                    return self._format_all_doctor_bu_kpi_justifications(
+                        doctor,
+                        metric,
+                    )
+                return self._format_all_doctor_bu_profiles(
+                    doctor,
+                    year=year,
+                    month=month,
+                )
+            if metric:
+                return self._format_doctor_kpi_justification(doctor, metric, bu=bu)
+            return self._format_doctor_kpi_profile(
+                doctor,
+                bu=bu,
+                year=year,
+                month=month,
             )
 
         if (
@@ -369,20 +410,28 @@ class OPDKpiAgent:
             and catalog_metric
             and not self.data.is_dataset_kpi(catalog_metric)
             and not asks_for_knowledge
-            and self._asks_for_missing_data_request(normalized)
-        ):
-            derived_response = self._format_dataverse_derived_kpi(
-                catalog_metric,
-                normalized=normalized,
-                bu=bu,
-                year=year,
-                month=month,
-                query=user_input,
+            and (
+                self._asks_for_missing_data_request(normalized)
+                or self._asks_to_submit_missing_kpi(normalized)
             )
-            if derived_response:
-                return derived_response
+            and (
+                self._has_kpi_request_context(normalized)
+                or self._asks_to_submit_missing_kpi(normalized)
+            )
+        ):
+            requested_kpi = self._extract_formula_lookup_kpi_name(user_input)
+            submit_request = self._asks_to_submit_missing_kpi(normalized)
+            if submit_request:
+                return self._format_generic_missing_kpi_request(
+                    requested_kpi or catalog_metric,
+                    bu=bu,
+                    year=year,
+                    month=month,
+                    query=user_input,
+                    submit_request=True,
+                )
             return self._format_generic_missing_kpi_request(
-                catalog_metric,
+                requested_kpi or catalog_metric,
                 bu=bu,
                 year=year,
                 month=month,
@@ -392,27 +441,33 @@ class OPDKpiAgent:
         if (
             metric is None
             and not asks_for_knowledge
-            and self._asks_for_missing_data_request(normalized)
+            and (
+                self._asks_for_missing_data_request(normalized)
+                or self._asks_to_submit_missing_kpi(normalized)
+            )
+            and (
+                self._has_kpi_request_context(normalized)
+                or self._asks_to_submit_missing_kpi(normalized)
+            )
         ):
-            requested_kpi = catalog_metric or self._extract_formula_lookup_kpi_name(
-                user_input
-            )
-            derived_response = self._format_dataverse_derived_kpi(
-                requested_kpi,
-                normalized=normalized,
-                bu=bu,
-                year=year,
-                month=month,
-                query=user_input,
-            )
-            if derived_response:
-                return derived_response
+            requested_kpi = self._extract_formula_lookup_kpi_name(user_input)
+            submit_request = self._asks_to_submit_missing_kpi(normalized)
+            if submit_request:
+                return self._format_generic_missing_kpi_request(
+                    requested_kpi,
+                    bu=bu,
+                    year=year,
+                    month=month,
+                    query=user_input,
+                    submit_request=True,
+                )
             return self._format_generic_missing_kpi_request(
                 requested_kpi,
                 bu=bu,
                 year=year,
                 month=month,
                 query=user_input,
+                submit_request=False,
             )
 
         if metric is None and (bu or year or month) and asks_for_kpi_overview:
@@ -437,6 +492,15 @@ class OPDKpiAgent:
                 return self._format_dataverse_formula_result(
                     lookup_kpi,
                     dataverse_formula,
+                )
+            if self._recommended_missing_kpi_definition(lookup_kpi):
+                return self._format_generic_missing_kpi_request(
+                    lookup_kpi,
+                    bu=bu,
+                    year=year,
+                    month=month,
+                    query=user_input,
+                    submit_request=True,
                 )
             return self._unknown_knowledge_kpi_message(
                 user_input,
@@ -466,6 +530,40 @@ class OPDKpiAgent:
                 knowledge = self._format_kpi_knowledge_lookup(metric, user_input)
                 return f"{root_cause}\n\n{knowledge}"
             return root_cause
+
+        if metric and self._asks_for_bu_comparison(normalized, user_input):
+            return self._format_bu_comparison(
+                metric,
+                bus=self._extract_bus_from_text(user_input),
+                year=year,
+                month=month,
+            )
+
+        if metric and self._asks_for_bu_ranking(normalized):
+            return self._format_bu_comparison(
+                metric,
+                year=year,
+                month=month,
+            )
+
+        if metric and self._asks_for_trend(normalized):
+            return self._format_kpi_trend(
+                metric,
+                bu=bu,
+                year=year,
+                month=month,
+            )
+
+        threshold_filter = self._extract_threshold_filter(user_input) if metric else None
+        if metric and threshold_filter and self._asks_for_doctor_ranking(normalized):
+            return self._format_doctors_by_threshold(
+                metric,
+                operator=threshold_filter["operator"],
+                threshold=threshold_filter["threshold"],
+                bu=bu,
+                year=year,
+                month=month,
+            )
 
         if metric and asks_for_knowledge:
             return self._format_kpi_knowledge_lookup(metric, user_input)
@@ -515,26 +613,95 @@ class OPDKpiAgent:
                 return self._format_kpi_value(metric, bu=bu, year=year, month=month)
             return self._format_kpi_knowledge_lookup(metric, user_input)
 
-        if doctor and asks_for_justification:
-            if not bu and self._doctor_has_multiple_bus(doctor):
-                if metric:
-                    return self._format_all_doctor_bu_kpi_justifications(
-                        doctor,
-                        metric,
-                    )
-                return self._format_all_doctor_bu_profiles(
-                    doctor,
-                    year=year,
-                    month=month,
-                )
-            if metric:
-                return self._format_doctor_kpi_justification(doctor, metric, bu=bu)
-            return self._format_doctor_kpi_profile(
-                doctor,
+        if metric and self._asks_for_kpi_value(
+            normalized,
+            bu=bu,
+            year=year,
+            month=month,
+        ):
+            return self._format_kpi_value(
+                metric,
                 bu=bu,
                 year=year,
                 month=month,
             )
+
+        return None
+
+    @staticmethod
+    def _conversational_response(
+        normalized: str,
+        raw_text: str = "",
+    ) -> str | None:
+        """Handle basic conversation without sending it through KPI routing."""
+        raw_compact = re.sub(r"[؟?!.،,\s]+", " ", str(raw_text)).strip().lower()
+
+        if raw_compact in {
+            "انت مين",
+            "أنت مين",
+            "من انت",
+            "من أنت",
+            "مين انت",
+            "مين أنت",
+        }:
+            return (
+                "أنا مساعد ذكاء مؤشرات العيادات الخارجية (OPD KPI Agent). "
+                "أحلل بيانات الأداء وقاعدة معرفة المؤشرات، وأساعدك في المقارنات "
+                "والاتجاهات والأسباب الجذرية وتعريفات المؤشرات ومعادلاتها."
+            )
+
+        if raw_compact in {
+            "بتعمل ايه",
+            "بتعمل إيه",
+            "ماذا تستطيع ان تفعل",
+            "ماذا تستطيع أن تفعل",
+            "تقدر تعمل ايه",
+            "تقدر تعمل إيه",
+        }:
+            return (
+                "أقدر أحلل أداء الأطباء ووحدات الأعمال، وأقارن المؤشرات عبر "
+                "الفترات، وأشرح التعريفات والمعادلات، وأبحث عن الأسباب الجذرية "
+                "وأقترح إجراءات عملية."
+            )
+
+        if normalized in {
+            "who are you",
+            "what are you",
+            "what is your name",
+            "tell me about yourself",
+        }:
+            return (
+                "I am the OPD KPI Intelligence Agent. I analyze the loaded "
+                "outpatient dataset and KPI knowledge base to explain performance, "
+                "compare doctors and business units, investigate root causes, and "
+                "retrieve KPI definitions and formulas."
+            )
+
+        if normalized in {
+            "what can you do",
+            "how can you help",
+            "help",
+            "show me what you can do",
+            "what do you do",
+        }:
+            return (
+                "I can help you:\n"
+                "- Analyze doctor and business-unit KPI performance\n"
+                "- Compare doctors, BUs, months, and years\n"
+                "- Explain KPI definitions, formulas, owners, and drivers\n"
+                "- Investigate root causes and recommend actions\n"
+                "- Show trends, rankings, thresholds, and performance gaps\n\n"
+                "For example: `Compare Patient Retention % across all BUs in 2023`."
+            )
+
+        if normalized in {"hi", "hello", "hey", "good morning", "good evening"}:
+            return (
+                "Hello. Ask me about an OPD KPI, doctor, business unit, trend, "
+                "comparison, formula, or root-cause investigation."
+            )
+
+        if normalized in {"thanks", "thank you", "thank you very much"}:
+            return "You are welcome."
 
         return None
 
@@ -629,6 +796,97 @@ class OPDKpiAgent:
         )
 
     @staticmethod
+    def _asks_to_submit_missing_kpi(normalized: str) -> bool:
+        """Require explicit approval before sending an external data request."""
+        return any(
+            term in normalized
+            for term in [
+                "submit missing kpi",
+                "submit a missing kpi",
+                "submit data request",
+                "send data request",
+                "request this kpi",
+                "request the kpi",
+                "request missing kpi",
+                "add this kpi",
+                "create this kpi",
+                "ask the data owner",
+                "send to power automate",
+                "submit patient level data request",
+                "submit patient-level data request",
+                "request patient level data",
+                "request patient-level data",
+            ]
+        )
+
+    def _asks_for_bu_comparison(self, normalized: str, user_input: str) -> bool:
+        asks_compare = any(
+            term in f" {normalized} "
+            for term in [" compare ", " comparison ", " versus ", " vs ", " across "]
+        )
+        mentions_bus = (
+            "business unit" in normalized
+            or bool(re.search(r"\bbus?\b", normalized))
+            or len(self._extract_bus_from_text(user_input)) >= 2
+        )
+        return asks_compare and mentions_bus
+
+    @staticmethod
+    def _asks_for_bu_ranking(normalized: str) -> bool:
+        mentions_bu = bool(re.search(r"\bbus?\b", normalized)) or any(
+            term in normalized
+            for term in ["business unit", "business units"]
+        )
+        asks_ranking = any(
+            term in normalized
+            for term in ["highest", "lowest", "top", "best", "worst", "rank"]
+        )
+        return mentions_bu and asks_ranking
+
+    @staticmethod
+    def _asks_for_trend(normalized: str) -> bool:
+        return any(
+            term in normalized
+            for term in [
+                "trend",
+                "over time",
+                "month by month",
+                "monthly",
+                "time series",
+            ]
+        )
+
+    @staticmethod
+    def _has_kpi_request_context(normalized: str) -> bool:
+        """Require operational context before treating unknown text as a missing KPI."""
+        return bool(re.search(r"\bbu\b", normalized)) or any(
+            term in normalized
+            for term in [
+                "kpi",
+                "metric",
+                "rate",
+                "percentage",
+                "percent",
+                "revenue",
+                "patient",
+                "appointment",
+                "visit",
+                "case",
+                "doctor",
+                "physician",
+                "business unit",
+                "payer",
+                "target",
+                "actual",
+                "retention",
+                "leakage",
+                "no show",
+                "satisfaction",
+                "performance",
+            ]
+        )
+
+    @staticmethod
     def _asks_for_doctor_ranking(normalized: str) -> bool:
         mentions_doctor = "doctor" in normalized or "physician" in normalized
         asks_ranking = any(
@@ -656,6 +914,285 @@ class OPDKpiAgent:
             and "target" in normalized
             and any(term in normalized for term in ["gap", "driver", "drivers", "recommendation", "analyze"])
         )
+
+    @staticmethod
+    def _asks_overall_target_progress(normalized: str) -> bool:
+        progress_terms = [
+            "are we progressing",
+            "are we improving",
+            "progress toward",
+            "progress towards",
+            "progress against",
+            "on track",
+        ]
+        portfolio_terms = [
+            "our targets",
+            "all major kpis",
+            "across all major kpis",
+            "latest period",
+            "previous period",
+            "all bus",
+            "all business units",
+        ]
+        return any(term in normalized for term in progress_terms) and (
+            "target" in normalized
+            or "kpi" in normalized
+            or any(term in normalized for term in portfolio_terms)
+        )
+
+    @staticmethod
+    def _asks_most_declining_bu(normalized: str) -> bool:
+        mentions_bu = bool(re.search(r"\bbus?\b", normalized)) or any(
+            term in normalized
+            for term in ["business unit", "business units"]
+        )
+        asks_decline = any(
+            term in normalized
+            for term in [
+                "most declining",
+                "declining most",
+                "biggest decline",
+                "largest decline",
+                "worst progress",
+                "falling most",
+            ]
+        )
+        return mentions_bu and asks_decline
+
+    def _format_most_declining_bu(self) -> str:
+        df = self.data.df.copy()
+        required = {
+            "Date",
+            "BU",
+            "Total Revenue",
+            "Target Revenue",
+            "No. Cases",
+            "Target No. cases",
+        }
+        if df.empty or not required.issubset(df.columns):
+            return "The loaded dataset does not contain enough data to rank BU target progress."
+
+        current, previous = self.analytics._current_previous_periods(df)
+        current_label = self._period_label(current)
+        previous_label = self._period_label(previous)
+
+        def achievement(frame, actual_metric: str, target_metric: str) -> float:
+            actual = self._sum_metric(frame, actual_metric)
+            target = self._sum_metric(frame, target_metric)
+            return actual / target * 100 if target else 0.0
+
+        ranking = []
+        for bu_name in self.data.get_bu_list():
+            current_bu = current[current["BU"] == bu_name]
+            previous_bu = previous[previous["BU"] == bu_name]
+            revenue_current = achievement(
+                current_bu, "Total Revenue", "Target Revenue"
+            )
+            revenue_previous = achievement(
+                previous_bu, "Total Revenue", "Target Revenue"
+            )
+            cases_current = achievement(
+                current_bu, "No. Cases", "Target No. cases"
+            )
+            cases_previous = achievement(
+                previous_bu, "No. Cases", "Target No. cases"
+            )
+            revenue_change = revenue_current - revenue_previous
+            cases_change = cases_current - cases_previous
+            ranking.append(
+                {
+                    "bu": bu_name,
+                    "revenue_current": revenue_current,
+                    "revenue_previous": revenue_previous,
+                    "revenue_change": revenue_change,
+                    "cases_current": cases_current,
+                    "cases_previous": cases_previous,
+                    "cases_change": cases_change,
+                    "combined_change": (revenue_change + cases_change) / 2,
+                }
+            )
+
+        ranking.sort(key=lambda item: item["combined_change"])
+        most_declining = ranking[0]
+        lines = [
+            f"Most declining BU: {most_declining['bu']}",
+            "",
+            "Executive readout:",
+            (
+                f"From {previous_label} to {current_label}, "
+                f"{most_declining['bu']} had the largest combined decline in target "
+                f"achievement ({most_declining['combined_change']:+.1f} percentage points)."
+            ),
+            (
+                f"- Revenue achievement: {most_declining['revenue_previous']:.1f}% "
+                f"to {most_declining['revenue_current']:.1f}% "
+                f"({most_declining['revenue_change']:+.1f} pp)"
+            ),
+            (
+                f"- Case achievement: {most_declining['cases_previous']:.1f}% "
+                f"to {most_declining['cases_current']:.1f}% "
+                f"({most_declining['cases_change']:+.1f} pp)"
+            ),
+            "",
+            "BU decline ranking:",
+        ]
+        for index, item in enumerate(ranking, start=1):
+            lines.append(
+                f"{index}. {item['bu']}: combined {item['combined_change']:+.1f} pp; "
+                f"revenue {item['revenue_change']:+.1f} pp; "
+                f"cases {item['cases_change']:+.1f} pp"
+            )
+        lines.extend(
+            [
+                "",
+                "Method:",
+                "- Combined decline is the simple average of month-over-month changes in revenue and case target achievement.",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _format_overall_target_progress(self) -> str:
+        df = self.data.df.copy()
+        required = {"Date", "BU", "Total Revenue", "Target Revenue", "No. Cases", "Target No. cases"}
+        if df.empty or not required.issubset(df.columns):
+            return "The loaded dataset does not contain enough period and target data for an overall progress assessment."
+
+        current, previous = self.analytics._current_previous_periods(df)
+        current_label = self._period_label(current)
+        previous_label = self._period_label(previous)
+
+        def achievement(frame, actual_metric: str, target_metric: str) -> float:
+            actual = self._sum_metric(frame, actual_metric)
+            target = self._sum_metric(frame, target_metric)
+            return actual / target * 100 if target else 0.0
+
+        current_revenue_achievement = achievement(
+            current, "Total Revenue", "Target Revenue"
+        )
+        previous_revenue_achievement = achievement(
+            previous, "Total Revenue", "Target Revenue"
+        )
+        current_case_achievement = achievement(
+            current, "No. Cases", "Target No. cases"
+        )
+        previous_case_achievement = achievement(
+            previous, "No. Cases", "Target No. cases"
+        )
+
+        scorecard_metrics = [
+            "Total Revenue",
+            "No. Cases",
+            "Charge per case",
+            "Patient Retention %",
+            "No-Show %",
+            "Service Leakage %",
+            "Doctor PMS %",
+            "Actual COE Compliance %",
+            "Digital Actual CR%",
+        ]
+        scorecard = []
+        improving = 0
+        worsening = 0
+        stable = 0
+        for metric in scorecard_metrics:
+            if metric not in df.columns:
+                continue
+            current_value = self.analytics._aggregate_metric(current, metric)
+            previous_value = self.analytics._aggregate_metric(previous, metric)
+            change_pct = self._pct_change(current_value, previous_value)
+            direction = self._operational_direction(metric, change_pct)
+            if direction == "improving":
+                improving += 1
+            elif direction == "worsening":
+                worsening += 1
+            else:
+                stable += 1
+            scorecard.append(
+                (
+                    metric,
+                    current_value,
+                    previous_value,
+                    change_pct,
+                    direction,
+                )
+            )
+
+        achievement_improved = (
+            current_revenue_achievement >= previous_revenue_achievement
+            and current_case_achievement >= previous_case_achievement
+        )
+        if achievement_improved and improving > worsening:
+            verdict = "Progressing"
+        elif (
+            current_revenue_achievement < previous_revenue_achievement
+            and current_case_achievement < previous_case_achievement
+            and worsening > improving
+        ):
+            verdict = "Declining"
+        else:
+            verdict = "Mixed progress"
+
+        lines = [
+            f"Overall target progress: {verdict}",
+            "",
+            "Executive readout:",
+            (
+                f"Comparing {current_label} with {previous_label}, "
+                f"{improving} major KPIs improved, {stable} were stable, and "
+                f"{worsening} worsened."
+            ),
+            (
+                f"- Revenue target achievement: {current_revenue_achievement:.1f}% "
+                f"vs {previous_revenue_achievement:.1f}% "
+                f"({current_revenue_achievement - previous_revenue_achievement:+.1f} percentage points)"
+            ),
+            (
+                f"- Case target achievement: {current_case_achievement:.1f}% "
+                f"vs {previous_case_achievement:.1f}% "
+                f"({current_case_achievement - previous_case_achievement:+.1f} percentage points)"
+            ),
+            "",
+            "Major KPI movement:",
+        ]
+        for metric, current_value, previous_value, change_pct, direction in scorecard:
+            lines.append(
+                f"- {metric}: {self._format_metric_value(metric, current_value)} "
+                f"vs {self._format_metric_value(metric, previous_value)} "
+                f"({change_pct:+.1f}%, {direction})"
+            )
+
+        lines.extend(["", "Progress by BU:"])
+        for bu in self.data.get_bu_list():
+            current_bu = current[current["BU"] == bu]
+            previous_bu = previous[previous["BU"] == bu]
+            revenue_current = achievement(
+                current_bu, "Total Revenue", "Target Revenue"
+            )
+            revenue_previous = achievement(
+                previous_bu, "Total Revenue", "Target Revenue"
+            )
+            cases_current = achievement(
+                current_bu, "No. Cases", "Target No. cases"
+            )
+            cases_previous = achievement(
+                previous_bu, "No. Cases", "Target No. cases"
+            )
+            lines.append(
+                f"- {bu}: revenue {revenue_current:.1f}% "
+                f"({revenue_current - revenue_previous:+.1f} pp); "
+                f"cases {cases_current:.1f}% "
+                f"({cases_current - cases_previous:+.1f} pp)"
+            )
+
+        lines.extend(
+            [
+                "",
+                "Interpretation:",
+                "- Progress is measured month over month; it does not prove a sustained trend.",
+                "- Review worsening KPIs and BUs with falling target achievement first.",
+            ]
+        )
+        return "\n".join(lines)
 
     def _format_total_revenue_diagnostic_checklist(
         self,
@@ -928,18 +1465,19 @@ class OPDKpiAgent:
         year: int | None = None,
         month: int | None = None,
         query: str = "",
-        provided_formula: str = "",
+        submit_request: bool = False,
     ) -> str:
         metadata = self.data.get_kpi_metadata(kpi_name)
         relationships = self.data.get_kpi_relationships(kpi_name)
-        if provided_formula:
-            formula = provided_formula
-            formula_source = "user-provided formula pending data-owner approval"
-            formula_lookup_status = ""
-        else:
-            formula, formula_source, formula_lookup_status = self._formula_with_fallback(
-                kpi_name,
-                query=query,
+        recommended_definition = self._recommended_missing_kpi_definition(kpi_name)
+        formula = metadata.get(
+            "Formula_Logic",
+            metadata.get("Financial_Impact_Formula", ""),
+        )
+        if not self._is_configured_value(formula):
+            formula = (
+                recommended_definition.get("formula", "")
+                or "To be defined by the data owner"
             )
         needed_fields = self._infer_missing_kpi_fields(
             kpi_name,
@@ -947,7 +1485,10 @@ class OPDKpiAgent:
             relationships,
             formula=formula,
         )
-        raw_data_domain = self._infer_raw_data_domain(kpi_name, metadata)
+        raw_data_domain = (
+            recommended_definition.get("raw_data_domain", "")
+            or self._infer_raw_data_domain(kpi_name, metadata)
+        )
         if self.data.resolve_catalog_kpi(kpi_name):
             unavailable_reason = (
                 f"{kpi_name} is configured in the knowledge base or KPI catalog, "
@@ -958,9 +1499,35 @@ class OPDKpiAgent:
                 f"{kpi_name} is not available as a numeric column in the loaded "
                 "OPD dataset."
             )
-        if not provided_formula and not self._is_configured_value(formula):
-            existing_status = self._lookup_missing_kpi_approval_status(
-                kpi_name,
+        if submit_request:
+            existing_status = self._format_cached_missing_kpi_approval_status(
+                kpi_name
+            )
+            if existing_status:
+                return existing_status
+
+        scope = self._scope_text(bu=bu, year=year, month=month)
+        lines = [
+            f"{kpi_name}{scope}: unavailable in the current dataset",
+            "",
+            "Direct answer:",
+            unavailable_reason,
+        ]
+        if recommended_definition:
+            lines.extend(
+                [
+                    "",
+                    "Recommended definition:",
+                    f"- Formula: {formula}",
+                    f"- Numerator: {recommended_definition['numerator']}",
+                    f"- Denominator: {recommended_definition['denominator']}",
+                    "- Note: This is a proposed operational definition and is not configured in the loaded knowledge base.",
+                ]
+            )
+
+        if submit_request:
+            request_status = self._submit_missing_data_request(
+                requested_kpi=kpi_name,
                 unavailable_reason=unavailable_reason,
                 needed_fields=needed_fields,
                 raw_data_domain=raw_data_domain,
@@ -969,87 +1536,61 @@ class OPDKpiAgent:
                     "year": year or "all",
                     "month": month or "all",
                 },
+                recommended_definition={
+                    "name": kpi_name,
+                    "formula": formula,
+                    "numerator": recommended_definition.get(
+                        "numerator",
+                        "To be defined by the data owner",
+                    ),
+                    "denominator": recommended_definition.get(
+                        "denominator",
+                        "To be defined by the data owner",
+                    ),
+                    "grain": recommended_definition.get(
+                        "grain",
+                        self._infer_kpi_grain(kpi_name, metadata),
+                    ),
+                },
+                requested_formula=formula if recommended_definition else "",
             )
-            if existing_status:
-                return existing_status
-
-            self.pending_missing_kpi_request = {
-                "kpi_name": kpi_name,
-                "bu": bu,
-                "year": year,
-                "month": month,
-                "query": query,
-            }
-            scope = self._scope_text(bu=bu, year=year, month=month)
-            return "\n".join(
+            lines.extend(
                 [
-                    f"{kpi_name}{scope}: unavailable in the current dataset",
                     "",
-                    "Direct answer:",
-                    unavailable_reason,
+                    "Data request status:",
+                    request_status,
+                ]
+            )
+        else:
+            lines.extend(
+                [
                     "",
-                    "Formula needed:",
-                    "I could not find a configured formula for this KPI in the knowledge base or Dataverse formula lookup.",
-                    f"Please write the formula for {kpi_name}, for example:",
-                    f"{kpi_name} = Numerator / Denominator x 100",
-                    "",
-                    "After you send the formula, I will submit the missing-KPI request with the formula so the table owner can approve or reject it.",
-                    "",
-                    "Needed data fields:",
-                    self._format_list(needed_fields),
-                    *(
-                        ["", f"Formula lookup status: {formula_lookup_status}"]
-                        if formula_lookup_status
-                        else []
+                    "No data request was sent.",
+                    (
+                        "To submit this KPI to the data-owner workflow, explicitly "
+                        f"ask: `Submit a missing KPI request for {kpi_name}`."
                     ),
                 ]
             )
-        request_status = self._submit_missing_data_request(
-            requested_kpi=kpi_name,
-            unavailable_reason=unavailable_reason,
-            needed_fields=needed_fields,
-            raw_data_domain=raw_data_domain,
-            scope={
-                "bu": bu or "all",
-                "year": year or "all",
-                "month": month or "all",
-            },
-            recommended_definition={
-                "name": kpi_name,
-                "formula": formula,
-                "numerator": self._infer_formula_part(formula, "numerator"),
-                "denominator": self._infer_formula_part(formula, "denominator"),
-                "grain": self._infer_kpi_grain(kpi_name, metadata),
-            },
-            requested_formula=formula,
-        )
-
-        scope = self._scope_text(bu=bu, year=year, month=month)
-        lines = [
-            f"{kpi_name}{scope}: unavailable in the current dataset",
-            "",
-            "Direct answer:",
-            unavailable_reason,
-            "",
-            "Definition context:",
-            f"- Business question: {metadata.get('Business_Question', 'Not configured')}",
-            f"- Formula: {formula}",
-            f"- Formula source: {formula_source}",
-            *(
-                [f"- Formula lookup status: {formula_lookup_status}"]
-                if formula_lookup_status
-                else []
-            ),
-            f"- Primary driver: {metadata.get('Primary_Driver_KPI', 'Not configured')}",
-            f"- Secondary driver: {metadata.get('Secondary_Driver_KPI', 'Not configured')}",
-            "",
-            "Needed data fields:",
-            self._format_list(needed_fields),
-            "",
-            "Data request:",
-            request_status,
-        ]
         return "\n".join(lines)
+
+    def _recommended_missing_kpi_definition(self, kpi_name: str) -> dict:
+        """Return a clearly labeled proposal for common unavailable KPIs."""
+        normalized = self.data.normalize_lookup_text(kpi_name)
+        if "rejection" in normalized or "rejected claim" in normalized:
+            return {
+                "formula": (
+                    "(Rejected or denied claims / Total submitted claims) x 100"
+                ),
+                "numerator": "Rejected or denied claims",
+                "denominator": "Total submitted claims",
+                "raw_data_domain": "patient_claims",
+                "grain": (
+                    "patient encounter / claim line with claim ID, patient key, "
+                    "doctor, BU, payer, submission date, and claim status"
+                ),
+            }
+        return {}
 
     def _format_patient_level_unavailable_request(
         self,
@@ -1057,6 +1598,7 @@ class OPDKpiAgent:
         bu: str | None = None,
         year: int | None = None,
         month: int | None = None,
+        submit_request: bool = False,
     ) -> str:
         metadata = self.data.get_kpi_metadata(metric)
         scope = self._scope_text(bu=bu, year=year, month=month)
@@ -1067,48 +1609,56 @@ class OPDKpiAgent:
             "identifiers, or encounter-level event timestamps needed to list the "
             "underlying patients."
         )
-        request_status = self._submit_missing_data_request(
-            requested_kpi=f"Patient-level {metric}",
-            unavailable_reason=unavailable_reason,
-            needed_fields=needed_fields,
-            raw_data_domain=self._infer_patient_level_domain(metric),
-            scope={
-                "bu": bu or "all",
-                "year": year or "all",
-                "month": month or "all",
-            },
-            recommended_definition={
-                "name": f"Patient-level {metric}",
-                "formula": metric,
-                "numerator": metric,
-                "denominator": "Patient or appointment-level source records",
-                "grain": self._infer_patient_level_grain(metric),
-            },
-            requested_formula=metric,
-        )
-
-        return "\n".join(
-            [
-                f"Patient-level details for {metric}{scope}: unavailable",
-                "",
-                "Direct answer:",
-                unavailable_reason,
-                "",
-                "What is available now:",
-                "- Aggregated KPI values can be summarized by BU, doctor, and month.",
-                "- Patient-level rows cannot be listed from the current extract.",
-                "",
-                "Knowledge-base context:",
-                f"- Business question: {metadata.get('Business_Question', 'Not configured')}",
-                f"- Formula: {metadata.get('Formula_Logic', metadata.get('Financial_Impact_Formula', 'Not configured'))}",
-                "",
-                "Needed patient-level fields:",
-                self._format_list(needed_fields),
-                "",
-                "Data request:",
-                request_status,
-            ]
-        )
+        lines = [
+            f"Patient-level details for {metric}{scope}: unavailable",
+            "",
+            "Direct answer:",
+            unavailable_reason,
+            "",
+            "What is available now:",
+            "- Aggregated KPI values can be summarized by BU, doctor, and month.",
+            "- Patient-level rows cannot be listed from the current extract.",
+            "",
+            "Knowledge-base context:",
+            f"- Business question: {metadata.get('Business_Question', 'Not configured')}",
+            f"- Formula: {metadata.get('Formula_Logic', metadata.get('Financial_Impact_Formula', 'Not configured'))}",
+            "",
+            "Needed patient-level fields:",
+            self._format_list(needed_fields),
+        ]
+        if submit_request:
+            request_status = self._submit_missing_data_request(
+                requested_kpi=f"Patient-level {metric}",
+                unavailable_reason=unavailable_reason,
+                needed_fields=needed_fields,
+                raw_data_domain=self._infer_patient_level_domain(metric),
+                scope={
+                    "bu": bu or "all",
+                    "year": year or "all",
+                    "month": month or "all",
+                },
+                recommended_definition={
+                    "name": f"Patient-level {metric}",
+                    "formula": metric,
+                    "numerator": metric,
+                    "denominator": "Patient or appointment-level source records",
+                    "grain": self._infer_patient_level_grain(metric),
+                },
+                requested_formula=metric,
+            )
+            lines.extend(["", "Data request:", request_status])
+        else:
+            lines.extend(
+                [
+                    "",
+                    "No data request was sent.",
+                    (
+                        "Patient-level requests are normally submitted automatically "
+                        "to the data-owner workflow."
+                    ),
+                ]
+            )
+        return "\n".join(lines)
 
     def _lookup_missing_kpi_approval_status(
         self,
@@ -1235,68 +1785,6 @@ class OPDKpiAgent:
                 ]
             )
         return "\n".join(lines)
-
-    def _handle_pending_missing_kpi_formula(self, user_input: str) -> str | None:
-        if not self.pending_missing_kpi_request:
-            return None
-
-        normalized = self.data.normalize_lookup_text(user_input)
-        if normalized in {"cancel", "stop", "never mind", "nevermind"}:
-            kpi_name = self.pending_missing_kpi_request.get("kpi_name", "the KPI")
-            self.pending_missing_kpi_request = None
-            return f"Okay, I cancelled the missing-KPI request for {kpi_name}."
-
-        formula = self._extract_user_provided_formula(user_input)
-        if not formula:
-            kpi_name = self.pending_missing_kpi_request.get("kpi_name", "this KPI")
-            return (
-                f"Please send the formula for {kpi_name}, for example: "
-                f"{kpi_name} = Numerator / Denominator x 100. "
-                "Send `cancel` if you do not want to submit the request."
-            )
-
-        pending = self.pending_missing_kpi_request
-        self.pending_missing_kpi_request = None
-        return self._format_generic_missing_kpi_request(
-            pending["kpi_name"],
-            bu=pending.get("bu"),
-            year=pending.get("year"),
-            month=pending.get("month"),
-            query=pending.get("query", ""),
-            provided_formula=formula,
-        )
-
-    def _extract_user_provided_formula(self, user_input: str) -> str:
-        text = str(user_input or "").strip()
-        if not text:
-            return ""
-
-        text = re.sub(
-            r"^\s*(?:the\s+)?formula\s+(?:is|=|:)\s*",
-            "",
-            text,
-            flags=re.IGNORECASE,
-        ).strip()
-        text = re.sub(r"[.]+$", "", text).strip()
-        if not text:
-            return ""
-
-        normalized = self.data.normalize_lookup_text(text)
-        formula_terms = {
-            "divided",
-            "denominator",
-            "formula",
-            "minus",
-            "numerator",
-            "over",
-            "plus",
-            "rate",
-            "ratio",
-            "total",
-        }
-        has_operator = bool(re.search(r"[=/÷+\-*]", text)) or " x " in f" {text.lower()} "
-        has_formula_word = bool(set(normalized.split()) & formula_terms)
-        return text if has_operator or has_formula_word else ""
 
     def _format_dataverse_derived_kpi(
         self,
@@ -1903,14 +2391,21 @@ class OPDKpiAgent:
             return text
 
         patterns = [
+            r"^\s*submit\s+(?:a\s+)?missing\s+kpi\s+request\s+(?:for\s+)?",
+            r"^\s*(?:submit|send)\s+(?:a\s+)?data\s+request\s+(?:for\s+)?",
             r"^\s*can\s+you\s+(?:please\s+)?(?:calculate|show|compare|rank)\s+",
+            r"^\s*can\s+you\s+(?:please\s+)?give\s+me\s+",
             r"^\s*could\s+you\s+(?:please\s+)?(?:calculate|show|compare|rank)\s+",
+            r"^\s*could\s+you\s+(?:please\s+)?give\s+me\s+",
             r"^\s*please\s+(?:calculate|show|compare|rank)\s+",
+            r"^\s*please\s+give\s+me\s+",
+            r"^\s*give\s+me\s+",
             r"^\s*what\s+is\s+the\s+formula\s+(?:of|for)\s+",
             r"^\s*what\s+is\s+formula\s+(?:of|for)\s+",
             r"^\s*which\s+doctor\s+(?:caused|has|had|shows|showed)\s+(?:the\s+)?(?:highest|lowest|top|worst|best)\s+",
             r"^\s*which\s+doctor\s+(?:has|had|shows|showed)\s+",
             r"^\s*who\s+(?:caused|has|had|shows|showed)\s+(?:the\s+)?(?:highest|lowest|top|worst|best)\s+",
+            r"^\s*show\s+me\s+",
             r"^\s*(?:show|compare|rank)\s+(?:the\s+)?(?:highest|lowest|top|worst|best)?\s*",
             r"^\s*what\s+is\s+the\s+",
             r"^\s*what\s+is\s+",
@@ -1930,6 +2425,12 @@ class OPDKpiAgent:
             flags=re.IGNORECASE,
         ).strip()
         cleaned = re.sub(r"[?.!]+$", "", cleaned).strip()
+        cleaned = re.sub(
+            r"\s*(?:,?\s+and\s+)?(?:its|the)?\s*(?:calculation\s+)?formula\s*$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
         cleaned = re.sub(
             r"\b(?:by|per)\s+doctor\b.*$",
             "",
@@ -3349,6 +3850,15 @@ Doctor: {doctor_label}
                 return doctor
         return None
 
+    @staticmethod
+    def _extract_kpi_filter(filter_context: str) -> str:
+        match = re.search(
+            r"(?:^|,\s*)KPI:\s*(.+?)(?=,\s*(?:BU|Doctor|Year):|[.\n]|$)",
+            str(filter_context),
+            flags=re.IGNORECASE,
+        )
+        return match.group(1).strip() if match else ""
+
     def _doctor_name_mask(self, df, doctor_name: str):
         normalized = self.data.normalize_lookup_text(doctor_name)
         return (
@@ -3451,6 +3961,43 @@ Doctor: {doctor_label}
                     parts.append(str(item))
             return "\n".join(parts)
         return str(content)
+
+    def _format_agent_error(self, exc: Exception) -> str:
+        """Return a useful response without exposing raw provider errors."""
+        error_text = str(exc).lower()
+        if "organization_restricted" in error_text or "organization has been restricted" in error_text:
+            return (
+                "The configured AI provider is currently restricted, so broader "
+                "free-form reasoning is unavailable. I can still answer supported "
+                "OPD questions directly from the loaded dataset and knowledge base, "
+                "including KPI values, comparisons, trends, formulas, and root-cause "
+                "analysis. The Groq organization or API key must be restored to "
+                "enable general conversation."
+            )
+
+        if any(
+            term in error_text
+            for term in [
+                "authentication",
+                "api key",
+                "rate limit",
+                "connection",
+                "timeout",
+            ]
+        ):
+            return (
+                "The AI provider is temporarily unavailable. I can still handle "
+                "supported OPD analytics and knowledge-base questions directly. "
+                "Please check the configured Groq API key and service availability "
+                "for broader requests."
+            )
+
+        print(f"Agent request failed: {exc}")
+        return (
+            "I could not complete that free-form request, but the deterministic OPD "
+            "analytics tools are still available. Try asking for a KPI value, trend, "
+            "comparison, formula, doctor performance, or root-cause analysis."
+        )
 
     @staticmethod
     def _compact_text(value: str, max_length: int = 500) -> str:

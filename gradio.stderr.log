@@ -1,0 +1,2 @@
+C:\Users\nouran.morsy\Downloads\OPD Agent\src\data\vector_store.py:49: LangChainDeprecationWarning: The class `OllamaEmbeddings` was deprecated in LangChain 0.3.1 and will be removed in 1.0.0. An updated version of the class exists in the `langchain-ollama package and should be used instead. To use it run `pip install -U `langchain-ollama` and import as `from `langchain_ollama import OllamaEmbeddings``.
+  self._embeddings = OllamaEmbeddings(model=model)

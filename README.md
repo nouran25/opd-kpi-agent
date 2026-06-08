@@ -97,7 +97,9 @@ This project uses a lightweight RAG pattern:
 
 1. The app loads `data/Knowledge base.xlsx`.
 2. `src/data/vector_store.py` indexes knowledge-base rows and KPI catalog aliases into a local persistent ChromaDB collection.
-3. KPI knowledge questions retrieve the most relevant records from Chroma.
+3. KPI knowledge questions combine Chroma vector retrieval with local BM25-style
+   keyword retrieval, then rerank candidates using both signals plus exact KPI
+   and phrase matches.
 4. The final answer shows readable KPI fields and a concise source line instead of raw retrieved records.
 
 Chroma is used for knowledge retrieval, not numeric calculations. Exact KPI values still come from dataframe analytics.
@@ -202,7 +204,7 @@ Persistent ChromaDB knowledge-store layer.
 - Indexes knowledge-base rows
 - Indexes KPI catalog aliases
 - Supports semantic search and KPI-scoped retrieval
-- Uses a local hash-based embedding function, so no hosted embedding API is required
+- Uses Ollama embeddings when available, with a local hash-based fallback so no hosted embedding API is required
 
 ### `src/analytics/engine.py`
 
@@ -283,6 +285,8 @@ Common environment variables:
 | `LLM_MAX_TOKENS` | `1024` | Maximum generated tokens |
 | `LLM_TIMEOUT` | `60` | LLM request timeout in seconds |
 | `LLM_MAX_RETRIES` | `2` | LLM retry count |
+| `EMBEDDING_PROVIDER` | `auto` | Knowledge-store embedding backend: `auto`, `ollama`, or `hash` |
+| `EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model name when using Ollama |
 | `VECTOR_STORE_PATH` | `data/chroma_DB` | Local generated Chroma database folder |
 | `SERVER_HOST` | `127.0.0.1` locally, `0.0.0.0` on Spaces | Gradio host |
 | `POWER_AUTOMATE_DATA_REQUEST_URL` | Empty | Optional Power Automate HTTP trigger URL for missing KPI/raw-data requests |
@@ -299,6 +303,17 @@ $env:LLM_REASONING_EFFORT="medium"
 $env:LLM_MAX_TOKENS="1024"
 python app.py
 ```
+
+For semantic Chroma retrieval with local Ollama embeddings:
+
+```powershell
+ollama pull nomic-embed-text
+$env:EMBEDDING_PROVIDER="ollama"
+$env:EMBEDDING_MODEL="nomic-embed-text"
+python app.py
+```
+
+With `EMBEDDING_PROVIDER=auto`, the app tries Ollama first and falls back to the local hash embedder if Ollama is unavailable. Chroma records the active embedding signature and rebuilds the generated collection when the provider or model changes.
 
 ### Dataverse Formula Fallback
 
@@ -347,7 +362,7 @@ When a user asks for a formula, the agent checks the Excel knowledge base first.
 
 ### Missing KPI / Raw Data Requests
 
-When a user asks for a KPI that needs unavailable patient-level or claims-level raw data, the agent can submit a structured request to a Power Automate flow. Configure the flow with an HTTP trigger, then set:
+When a user asks for unavailable patient-level raw data, the agent automatically submits a structured request to a Power Automate flow. Other missing KPI or claims-level requests still require the user to explicitly ask for submission. Configure the flow with an HTTP trigger, then set:
 
 ```powershell
 $env:POWER_AUTOMATE_DATA_REQUEST_URL="https://prod-xx.logic.azure.com/..."

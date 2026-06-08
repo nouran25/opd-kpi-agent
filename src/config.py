@@ -18,6 +18,7 @@ class Config:
 
     # Model settings
     llm_model: str = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
+    embedding_provider: str = os.getenv("EMBEDDING_PROVIDER", "auto")
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
     temperature: float = float(os.getenv("TEMPERATURE", "0.0"))
     llm_max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "1024"))
